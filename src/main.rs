@@ -12,16 +12,15 @@ use parking_lot::Mutex;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     model::{Implementation, ServerCapabilities, ServerInfo},
-    schemars,
-    tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
+    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use rustecal::pubsub::publisher::Timestamp;
-use rustecal_core::core_types::monitoring::TransportLayerType;
-use rustecal_core::log_level::LogLevel;
 use rustecal::{
     Ecal, EcalComponents, PublisherMessage, ServiceClient, ServiceRequest, TypedPublisher,
     TypedSubscriber,
 };
+use rustecal_core::core_types::monitoring::TransportLayerType;
+use rustecal_core::log_level::LogLevel;
 use rustecal_types_bytes::BytesMessage;
 use rustecal_types_string::StringMessage;
 use serde::{Deserialize, Serialize};
@@ -480,8 +479,9 @@ struct CallServiceResult {
 struct EcalServer;
 
 fn snapshot() -> Result<rustecal_core::core_types::monitoring::MonitoringSnapshot, McpError> {
-    rustecal_core::monitoring::Monitoring::get_snapshot()
-        .map_err(|e| McpError::internal_error(format!("eCAL monitoring snapshot failed: {e:?}"), None))
+    rustecal_core::monitoring::Monitoring::get_snapshot().map_err(|e| {
+        McpError::internal_error(format!("eCAL monitoring snapshot failed: {e:?}"), None)
+    })
 }
 
 fn transport_kind(t: &TransportLayerType) -> String {
@@ -640,10 +640,7 @@ fn measure_topic(topic: &str, duration_ms: u64) -> Result<TopicStatsResult, Stri
 ///   least one subscriber advertised a non-empty active transport set; eCAL
 ///   sometimes leaves subscriber transport_layers empty in monitoring
 ///   snapshots, in which case "no shared transport" is not a real finding.
-fn intersect_active_transports(
-    pubs: &[TopicEntry],
-    subs: &[TopicEntry],
-) -> (Vec<String>, bool) {
+fn intersect_active_transports(pubs: &[TopicEntry], subs: &[TopicEntry]) -> (Vec<String>, bool) {
     fn merge_active(side: &[TopicEntry]) -> std::collections::BTreeSet<String> {
         let mut acc: std::collections::BTreeSet<String> = Default::default();
         for e in side {
@@ -681,7 +678,11 @@ fn process_entry(p: rustecal_core::core_types::monitoring::ProcessInfo) -> Proce
 /// case-insensitive containment of any 3+ char substring of the target
 /// scores highest, then prefer names with smaller absolute length
 /// difference. Good enough to catch typos / wrong namespace prefixes.
-fn similar_names<'a>(target: &str, candidates: impl Iterator<Item = &'a str>, limit: usize) -> Vec<String> {
+fn similar_names<'a>(
+    target: &str,
+    candidates: impl Iterator<Item = &'a str>,
+    limit: usize,
+) -> Vec<String> {
     let t_lower = target.to_ascii_lowercase();
     let t_grams: Vec<&str> = (0..t_lower.len().saturating_sub(2))
         .filter_map(|i| t_lower.get(i..i + 3))
@@ -692,10 +693,7 @@ fn similar_names<'a>(target: &str, candidates: impl Iterator<Item = &'a str>, li
                 return None;
             }
             let lower = c.to_ascii_lowercase();
-            let hits = t_grams
-                .iter()
-                .filter(|g| lower.contains(*g))
-                .count() as i32;
+            let hits = t_grams.iter().filter(|g| lower.contains(*g)).count() as i32;
             // Score: 3-gram hits dominate, then -|length difference|.
             let len_diff = (lower.len() as i32 - t_lower.len() as i32).abs();
             let score = hits * 100 - len_diff;
@@ -717,7 +715,9 @@ fn similar_names<'a>(target: &str, candidates: impl Iterator<Item = &'a str>, li
 fn name_matches(haystack: &str, pattern: &Option<String>) -> bool {
     match pattern.as_deref() {
         None | Some("") => true,
-        Some(p) => haystack.to_ascii_lowercase().contains(&p.to_ascii_lowercase()),
+        Some(p) => haystack
+            .to_ascii_lowercase()
+            .contains(&p.to_ascii_lowercase()),
     }
 }
 
@@ -748,11 +748,13 @@ impl EcalServer {
         Self
     }
 
-    #[tool(description = "List eCAL publishers currently visible on the network. \
+    #[tool(
+        description = "List eCAL publishers currently visible on the network. \
         Returns topic name, data type, transport layers, host, process, and \
         traffic stats. Pass `name_pattern` to substring-filter by topic, and \
         `include_descriptors=true` to attach base-64 type descriptor blobs \
-        (off by default; can be tens of KB each).")]
+        (off by default; can be tens of KB each)."
+    )]
     async fn ecal_list_publishers(
         &self,
         Parameters(args): Parameters<ListFilter>,
@@ -769,8 +771,10 @@ impl EcalServer {
         Ok(Json(PublishersResult { publishers }))
     }
 
-    #[tool(description = "List eCAL subscribers currently visible on the network. \
-        Same shape and filtering as `ecal_list_publishers`.")]
+    #[tool(
+        description = "List eCAL subscribers currently visible on the network. \
+        Same shape and filtering as `ecal_list_publishers`."
+    )]
     async fn ecal_list_subscribers(
         &self,
         Parameters(args): Parameters<ListFilter>,
@@ -787,9 +791,11 @@ impl EcalServer {
         Ok(Json(SubscribersResult { subscribers }))
     }
 
-    #[tool(description = "List eCAL service servers visible on the network, including each \
+    #[tool(
+        description = "List eCAL service servers visible on the network, including each \
         method's request/response types. Pass `name_pattern` to substring-filter by \
-        service name.")]
+        service name."
+    )]
     async fn ecal_list_services(
         &self,
         Parameters(args): Parameters<ListFilter>,
@@ -821,9 +827,11 @@ impl EcalServer {
         Ok(Json(ServicesResult { services }))
     }
 
-    #[tool(description = "List eCAL service *clients* visible on the network. Useful for \
+    #[tool(
+        description = "List eCAL service *clients* visible on the network. Useful for \
         discovering who is calling which service. Pass `name_pattern` to substring-filter \
-        by service name.")]
+        by service name."
+    )]
     async fn ecal_list_service_clients(
         &self,
         Parameters(args): Parameters<ListFilter>,
@@ -855,22 +863,22 @@ impl EcalServer {
         Ok(Json(ServiceClientsResult { clients }))
     }
 
-    #[tool(description = "Drain pending eCAL log messages emitted by all processes since the \
+    #[tool(
+        description = "Drain pending eCAL log messages emitted by all processes since the \
         last call. Calls `eCAL_Logging_GetLogging`, which empties the local log buffer; \
         repeated calls only return new entries. Optional filters: `min_level` (one of \
         info|warning|error|fatal|debug1|debug2|debug3, default info) drops anything \
         below the named severity; `since_timestamp_us` drops anything older; \
-        `process_name_pattern` substring-filters by emitting process.")]
+        `process_name_pattern` substring-filters by emitting process."
+    )]
     async fn ecal_get_logs(
         &self,
         Parameters(args): Parameters<GetLogsArgs>,
     ) -> Result<Json<LogsResult>, McpError> {
-        let logs = tokio::task::spawn_blocking(|| {
-            rustecal_core::log::Log::get_logging()
-        })
-        .await
-        .map_err(|e| McpError::internal_error(format!("get_logs task join: {e}"), None))?
-        .map_err(|e| McpError::internal_error(format!("eCAL log fetch failed: {e:?}"), None))?;
+        let logs = tokio::task::spawn_blocking(|| rustecal_core::log::Log::get_logging())
+            .await
+            .map_err(|e| McpError::internal_error(format!("get_logs task join: {e}"), None))?
+            .map_err(|e| McpError::internal_error(format!("eCAL log fetch failed: {e:?}"), None))?;
 
         // Default min_level = info (drop debug noise).
         let min_priority = args
@@ -898,8 +906,10 @@ impl EcalServer {
         Ok(Json(LogsResult { logs }))
     }
 
-    #[tool(description = "List eCAL processes visible on the network. Pass `name_pattern` \
-        to substring-filter against `unit_name` or `process_name`.")]
+    #[tool(
+        description = "List eCAL processes visible on the network. Pass `name_pattern` \
+        to substring-filter against `unit_name` or `process_name`."
+    )]
     async fn ecal_list_processes(
         &self,
         Parameters(args): Parameters<ListFilter>,
@@ -960,7 +970,9 @@ impl EcalServer {
                 let publisher = TypedPublisher::<StringMessage>::new(&topic)
                     .map_err(|e| format!("create publisher: {e}"))?;
                 await_subscriber(&publisher, discovery_wait);
-                let msg = StringMessage { data: text.clone().into() };
+                let msg = StringMessage {
+                    data: text.clone().into(),
+                };
                 bytes_sent = text.as_bytes().len();
                 for i in 0..repeat {
                     if publisher.send(&msg, Timestamp::Auto) {
@@ -978,7 +990,9 @@ impl EcalServer {
                 let publisher = TypedPublisher::<BytesMessage>::new(&topic)
                     .map_err(|e| format!("create publisher: {e}"))?;
                 await_subscriber(&publisher, discovery_wait);
-                let msg = BytesMessage { data: Cow::Owned(raw) };
+                let msg = BytesMessage {
+                    data: Cow::Owned(raw),
+                };
                 for i in 0..repeat {
                     if publisher.send(&msg, Timestamp::Auto) {
                         sends_ok += 1;
@@ -1003,8 +1017,10 @@ impl EcalServer {
         Ok(Json(result))
     }
 
-    #[tool(description = "Subscribe to an eCAL topic for a fixed duration and return any \
-        samples seen. Payloads are returned as both base-64 bytes and (when valid UTF-8) text.")]
+    #[tool(
+        description = "Subscribe to an eCAL topic for a fixed duration and return any \
+        samples seen. Payloads are returned as both base-64 bytes and (when valid UTF-8) text."
+    )]
     async fn ecal_subscribe(
         &self,
         Parameters(args): Parameters<SubscribeArgs>,
@@ -1064,9 +1080,11 @@ impl EcalServer {
         Ok(Json(result))
     }
 
-    #[tool(description = "Call an eCAL service method on every discovered server instance. \
+    #[tool(
+        description = "Call an eCAL service method on every discovered server instance. \
         Provide either `text` (UTF-8 string) or `payload_base64` (raw bytes) as the request \
-        payload. Returns one entry per server instance.")]
+        payload. Returns one entry per server instance."
+    )]
     async fn ecal_call_service(
         &self,
         Parameters(args): Parameters<CallServiceArgs>,
@@ -1094,11 +1112,8 @@ impl EcalServer {
             let client = ServiceClient::new(&service_name)
                 .map_err(|e| format!("create service client: {e}"))?;
 
-            let deadline = std::time::Instant::now()
-                + Duration::from_millis(discovery_wait_ms);
-            while client.get_client_instances().is_empty()
-                && std::time::Instant::now() < deadline
-            {
+            let deadline = std::time::Instant::now() + Duration::from_millis(discovery_wait_ms);
+            while client.get_client_instances().is_empty() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
             }
 
@@ -1193,11 +1208,13 @@ impl EcalServer {
         Ok(Json(result))
     }
 
-    #[tool(description = "Measure the *live* throughput of an eCAL topic over a window. \
+    #[tool(
+        description = "Measure the *live* throughput of an eCAL topic over a window. \
         Subscribes for `duration_ms` (default 2000, capped at 60000) and returns observed \
         rate, payload size stats, and inter-arrival jitter. Unlike the cached \
         `data_frequency` field on `ecal_list_publishers`, this is what is actually on the \
-        wire right now.")]
+        wire right now."
+    )]
     async fn ecal_topic_stats(
         &self,
         Parameters(args): Parameters<TopicStatsArgs>,
@@ -1215,12 +1232,14 @@ impl EcalServer {
         Ok(Json(result))
     }
 
-    #[tool(description = "Diagnose why an eCAL topic may not be flowing. Combines a \
+    #[tool(
+        description = "Diagnose why an eCAL topic may not be flowing. Combines a \
         monitoring snapshot (all matching publishers + subscribers, their type signatures, \
         and per-side transport layers) with an optional live measurement window. Surfaces \
         a `findings` list of detected anomalies: type mismatches, no-publisher / \
         no-subscriber conditions, disjoint transport sets, and SHM-domain splits. This is \
-        the first tool to reach for when answering 'why am I not getting data?'.")]
+        the first tool to reach for when answering 'why am I not getting data?'."
+    )]
     async fn ecal_diagnose_topic(
         &self,
         Parameters(args): Parameters<DiagnoseTopicArgs>,
@@ -1366,10 +1385,13 @@ impl EcalServer {
             None
         } else {
             let topic_clone = topic.clone();
-            let measured = tokio::task::spawn_blocking(move || measure_topic(&topic_clone, duration_ms))
-                .await
-                .map_err(|e| McpError::internal_error(format!("diagnose task join: {e}"), None))?
-                .map_err(|e| McpError::internal_error(e, None))?;
+            let measured =
+                tokio::task::spawn_blocking(move || measure_topic(&topic_clone, duration_ms))
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("diagnose task join: {e}"), None)
+                    })?
+                    .map_err(|e| McpError::internal_error(e, None))?;
             if measured.samples_observed == 0 && !pubs.is_empty() {
                 findings.push(format!(
                     "no samples observed in {duration_ms}ms despite {} registered publisher(s)",
@@ -1429,8 +1451,7 @@ async fn main() -> Result<()> {
     // Logs go to stderr so they don't interfere with the MCP stdio framing.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn")),
         )
         .with_writer(std::io::stderr)
         .with_ansi(false)
@@ -1511,13 +1532,14 @@ mod tests {
         // Strict ordering — a regression that swaps two entries here would
         // silently corrupt the level filter in `ecal_get_logs`.
         let order = [
-            "debug4", "debug3", "debug2", "debug1",
-            "info", "warning", "error", "fatal",
+            "debug4", "debug3", "debug2", "debug1", "info", "warning", "error", "fatal",
         ];
         for w in order.windows(2) {
             assert!(
                 parse_min_level(w[0]) < parse_min_level(w[1]),
-                "ordering broken between {:?} and {:?}", w[0], w[1],
+                "ordering broken between {:?} and {:?}",
+                w[0],
+                w[1],
             );
         }
     }
@@ -1538,8 +1560,11 @@ mod tests {
             (LogLevel::Fatal, "fatal"),
         ];
         for (lvl, label) in pairs {
-            assert_eq!(level_priority(lvl), parse_min_level(label),
-                       "mismatch for {label}");
+            assert_eq!(
+                level_priority(lvl),
+                parse_min_level(label),
+                "mismatch for {label}"
+            );
         }
         // The sentinel values mean "no filter" and must hash to 0 so any
         // real entry passes through.
@@ -1570,9 +1595,11 @@ mod tests {
         let subs3 = vec![te(&[("shm", false), ("udp_multicast", false)])];
         let (common3, advertised3) = intersect_active_transports(&pubs3, &subs3);
         assert!(common3.is_empty());
-        assert!(!advertised3,
-                "subscriber with no active layers must clear `advertised` \
-                 so the diagnostic stays silent");
+        assert!(
+            !advertised3,
+            "subscriber with no active layers must clear `advertised` \
+                 so the diagnostic stays silent"
+        );
 
         // Inactive layers on both sides never count, even if they match.
         let pubs4 = vec![te(&[("shm", false)])];
@@ -1584,16 +1611,25 @@ mod tests {
 
     #[test]
     fn similar_names_basic_typo_and_edges() {
-        let pool = ["robot/imu", "robot/lidar", "robot/camera", "completely_unrelated"];
+        let pool = [
+            "robot/imu",
+            "robot/lidar",
+            "robot/camera",
+            "completely_unrelated",
+        ];
 
         let hits = similar_names("robot/img", pool.iter().copied(), 3);
-        assert!(hits.contains(&"robot/imu".to_string()),
-                "typo `robot/img` should suggest `robot/imu`: got {hits:?}");
+        assert!(
+            hits.contains(&"robot/imu".to_string()),
+            "typo `robot/img` should suggest `robot/imu`: got {hits:?}"
+        );
 
         // Exact match is excluded — suggestions are always alternatives.
         let exact = similar_names("robot/imu", pool.iter().copied(), 5);
-        assert!(!exact.contains(&"robot/imu".to_string()),
-                "exact match leaked into suggestions: {exact:?}");
+        assert!(
+            !exact.contains(&"robot/imu".to_string()),
+            "exact match leaked into suggestions: {exact:?}"
+        );
 
         // Empty target shouldn't blow up (it has no 3-grams → zero hits).
         assert!(similar_names("", pool.iter().copied(), 5).is_empty());
@@ -1608,7 +1644,11 @@ mod tests {
         assert_eq!(limited.len(), 2);
 
         // No fuzzy matches → empty (we never return total junk).
-        let none = similar_names("robot/imu", ["xyz_stuff", "qqq_unrelated"].iter().copied(), 5);
+        let none = similar_names(
+            "robot/imu",
+            ["xyz_stuff", "qqq_unrelated"].iter().copied(),
+            5,
+        );
         assert!(none.is_empty(), "expected no suggestions, got {none:?}");
     }
 }
