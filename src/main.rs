@@ -85,18 +85,27 @@ struct TopicEntry {
     data_frequency_millihertz: i32,
     /// `data_frequency_millihertz / 1000`, i.e. samples per second.
     data_frequency_hz: f64,
-    /// Per-message counter (`eCAL_Monitoring_STopic.data_id`). Increments on
-    /// every send; useful as an "is the publisher still moving?" liveness
-    /// indicator independent of `data_frequency_hz`.
+    /// eCAL `data_id` — the publisher's *set-id* (legacy filter id, see
+    /// `topic.proto`: "data send id (publisher setid)"). Constant per
+    /// publisher under the default v6 `Send` path; **not** a per-message
+    /// counter. For "is the publisher still moving?" use `data_clock`.
     data_id: i64,
-    /// Internal eCAL clock at the last sample (`data_clock`). Combined with
-    /// `data_id`, lets you tell whether two consecutive monitoring snapshots
-    /// saw new traffic.
+    /// eCAL `data_clock` — monotonic send/receive action counter. On a
+    /// publisher this advances on every `Send` (including the
+    /// no-subscriber path, where eCAL still calls `RefreshSendCounter`); on
+    /// a subscriber it advances per accepted sample. Diffing this across
+    /// two snapshots is the cheap liveness signal.
     data_clock: i64,
-    /// Number of registration heartbeats the producer has emitted since
-    /// `Ecal::initialize`. Cheap freshness signal — values increasing across
-    /// snapshots ⇒ the producer is alive; flat ⇒ may have crashed even
-    /// though it's still in the snapshot until the registration timeout.
+    /// eCAL monitoring's local counter for this entity: the monitoring
+    /// layer increments it every time it ingests a registration update for
+    /// the topic (`CMonitoringImpl::RegisterTopic` does
+    /// `topic.registration_clock++`). It is *not* sent over the wire by
+    /// the producer, so don't read it as "heartbeats since the producer
+    /// started" — read it as "how many registration cycles this monitor
+    /// has seen for that entity". Still useful as a freshness signal: flat
+    /// across snapshots ⇒ no recent registration update ⇒ the producer
+    /// may have died (entries persist until `registration_timeout`,
+    /// default 10s).
     registration_clock: i32,
     /// Transport layers this endpoint has used. See `TransportLayerEntry`
     /// for the meaning of `active`.
@@ -175,9 +184,11 @@ struct GetLogsArgs {
 }
 
 /// Severity *priority* used for `min_level` filtering. eCAL's numeric
-/// LogLevel values are bit flags (`Info=1, Debug1=16, Fatal=8, …`) which do
-/// **not** form a usable >= ordering, so we project them onto an ordinal
-/// scale here (verbose at the bottom, fatal at the top):
+/// `eLogLevel` values are bit flags
+/// (`Info=1, Warning=2, Error=4, Fatal=8, Debug1=16, Debug2=32, Debug3=64,
+/// Debug4=128`) which do **not** form a usable `>=` ordering (e.g. Debug1
+/// > Fatal numerically), so we project them onto an ordinal scale here
+/// (verbose at the bottom, fatal at the top):
 ///
 /// `debug4=1, debug3=2, debug2=3, debug1=4, info=5, warning=6, error=7, fatal=8`
 ///
@@ -333,10 +344,15 @@ struct ProcessEntry {
     process_id: i32,
     process_name: String,
     unit_name: String,
-    /// eCAL `state_severity` enum value. Anything > 0 means the process has
-    /// reported a non-healthy state (warning/critical/failed); see
-    /// `state_severity_level` for the integer rank.
+    /// eCAL `eProcessSeverity` enum value:
+    /// `0=unknown, 1=healthy, 2=warning, 3=critical, 4=failed`.
+    /// Treat `>= 2` (not `> 0` — `1` is *healthy*) as non-healthy. `0`
+    /// means the process never reported a state (common right after
+    /// startup).
     state_severity: i32,
+    /// eCAL `state_severity_level` (1..=5; 0 = unknown). Finer-grained
+    /// "level within severity" reported by the producer. Independent of
+    /// `state_severity`.
     state_severity_level: i32,
     state_info: String,
     runtime_version: String,
@@ -867,9 +883,10 @@ impl EcalServer {
         description = "Drain pending eCAL log messages emitted by all processes since the \
         last call. Calls `eCAL_Logging_GetLogging`, which empties the local log buffer; \
         repeated calls only return new entries. Optional filters: `min_level` (one of \
-        info|warning|error|fatal|debug1|debug2|debug3, default info) drops anything \
-        below the named severity; `since_timestamp_us` drops anything older; \
-        `process_name_pattern` substring-filters by emitting process."
+        debug4|debug3|debug2|debug1|info|warning|error|fatal, default info — the \
+        ordering is severity-ascending) drops anything below the named severity; \
+        `since_timestamp_us` drops anything older; `process_name_pattern` \
+        substring-filters by emitting process."
     )]
     async fn ecal_get_logs(
         &self,
@@ -952,10 +969,12 @@ impl EcalServer {
             let bytes_sent: usize;
 
             // Wait for at least one subscriber to be discovered, up to
-            // `discovery_wait`. eCAL's `Publisher::Send` returns `false` (and
-            // is effectively a no-op) when `GetSubscriberCount() == 0`, so
-            // polling here makes the first send actually land instead of
-            // silently failing on a fresh publisher.
+            // `discovery_wait`. eCAL's `CPublisher::Send` returns `false`
+            // when `GetSubscriberCount() == 0`: it still calls
+            // `RefreshSendCounter()` (so `data_clock` and frequency stats
+            // advance) but it does NOT put bytes on the wire. Polling here
+            // makes the first send actually land instead of silently
+            // dropping on a fresh publisher.
             fn await_subscriber<T: PublisherMessage>(
                 publisher: &TypedPublisher<T>,
                 budget: Duration,
@@ -1081,9 +1100,13 @@ impl EcalServer {
     }
 
     #[tool(
-        description = "Call an eCAL service method on every discovered server instance. \
-        Provide either `text` (UTF-8 string) or `payload_base64` (raw bytes) as the request \
-        payload. Returns one entry per server instance."
+        description = "Call an eCAL service method on every discovered server instance and \
+        return one entry per instance. Provide either `text` (UTF-8 string) or \
+        `payload_base64` (raw bytes) as the request payload. Set \
+        `target_server_entity_id` to filter the call down to a single replica — when \
+        used, `responses` may be shorter than the number of discovered instances; \
+        `discovered_instances` is preserved separately so callers can distinguish \
+        \"service is gone\" from \"my filter rejected every replica\"."
     )]
     async fn ecal_call_service(
         &self,
@@ -1175,12 +1198,18 @@ impl EcalServer {
                         responses.push(ServiceCallResponse {
                             instance_index: responses.len(),
                             success: false,
-                            // `instance.call` returns `None` when the underlying
-                            // C call fails *or* the configured timeout elapses;
-                            // we don't get the underlying eCAL error string.
+                            // In rustecal, `ClientInstance::call` only
+                            // returns `None` when `CString::new(method)`
+                            // fails (i.e. the method name has an interior
+                            // NUL byte). Real timeouts / server crashes /
+                            // transport failures come back as
+                            // `Some(ServiceResponse { success: false, .. })`
+                            // with `error_msg` populated by the C layer.
+                            // So this branch is unusual and indicates a
+                            // bad method string.
                             error: Some(format!(
-                                "service call returned no response within {timeout_ms} ms \
-                                 (timeout, server crash, or transport failure)"
+                                "rustecal returned None for method {method_name:?} \
+                                 (likely an interior NUL in the method name)"
                             )),
                             server_entity_id: 0,
                             server_process_id: 0,
@@ -1337,9 +1366,11 @@ impl EcalServer {
                 shm_transport_domains.len()
             ));
         }
-        // `message_drops` is a subscriber-side metric in eCAL: each
-        // subscriber compares the publisher's message counter to what it
-        // actually received. Attribute findings to the *subscriber* unit.
+        // `message_drops` is a subscriber-side metric: each subscriber
+        // tracks gaps in the per-sample sequence number (the publisher's
+        // `data_clock` / sample clock as carried in each eCAL sample) and
+        // counts the missing ones. Attribute findings to the *subscriber*
+        // unit.
         for s in &subs {
             if s.message_drops > 0 {
                 findings.push(format!(
@@ -1350,13 +1381,15 @@ impl EcalServer {
         }
         // Correlate with process state — a publisher whose process reports
         // warning/critical/failed will often surface as "no traffic" here.
+        // eCAL's `eProcessSeverity` is 0=unknown, 1=healthy, 2=warning,
+        // 3=critical, 4=failed; only `>= 2` is actually non-healthy.
         for e in pubs.iter().chain(subs.iter()) {
             if let Some(proc_state) = snap
                 .processes
                 .iter()
                 .find(|p| p.process_id == e.process_id && p.host_name == e.host_name)
             {
-                if proc_state.state_severity > 0 {
+                if proc_state.state_severity >= 2 {
                     findings.push(format!(
                         "{} '{}' (pid {}) is in non-healthy state (severity={}, level={}): {}",
                         e.direction,
@@ -1457,9 +1490,10 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    // ALL = DEFAULT | MONITORING | LOGGING | TIMESYNC, which gives us the
-    // monitoring snapshot AND log retrieval out of the box without having to
-    // remember the individual flags.
+    // EcalComponents::ALL = PUBLISHER | SUBSCRIBER | SERVICE | MONITORING |
+    // LOGGING | TIMESYNC. (DEFAULT already includes everything except
+    // MONITORING; we add MONITORING so `Monitoring::get_snapshot` works.)
+    // LOGGING is needed for `Log::get_logging`.
     Ecal::initialize(Some("ecal_mcp"), EcalComponents::ALL, None)
         .map_err(|e| anyhow::anyhow!("eCAL initialize failed: {e:?}"))?;
     tracing::info!("eCAL initialized; serving MCP over stdio");
