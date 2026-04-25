@@ -133,7 +133,17 @@ jobs:
           if (-not $asset) { throw "asset $exeName not found in $version" }
 
           $installer = Join-Path $env:RUNNER_TEMP $exeName
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers $headers
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -OutFile $installer `
+            -Headers $headers `
+            -MaximumRetryCount 5 `
+            -RetryIntervalSec 5
+          $size = (Get-Item $installer).Length
+          if ($size -lt 50MB) {
+            Get-Content $installer -TotalCount 5 | Out-Host
+            throw "downloaded $exeName looks too small ($size bytes) -- likely an HTML error page"
+          }
           Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
 
           if (-not (Test-Path 'C:\eCAL')) { throw "expected eCAL install at C:\eCAL" }
