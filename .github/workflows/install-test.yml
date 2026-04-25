@@ -99,10 +99,13 @@ jobs:
 
       - name: Re-install with version + prefix overrides
         shell: bash
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          # Resolve "latest" tag explicitly so we test the pinned-version code path.
-          tag=$(curl -fsSL https://api.github.com/repos/zpg6/ecal-mcp/releases/latest | jq -r .tag_name)
+          tag=$(curl -fsSL -H "Authorization: Bearer $GH_API_TOKEN" \
+            https://api.github.com/repos/zpg6/ecal-mcp/releases/latest \
+            | jq -r .tag_name)
           test -n "$tag" && test "$tag" != "null"
 
           ECAL_MCP_VERSION="$tag" ECAL_MCP_PREFIX="$HOME/.local" \
@@ -224,9 +227,14 @@ jobs:
 
       - name: Re-install with version + prefix overrides
         shell: pwsh
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $headers = @{ 'User-Agent' = 'ecal-mcp-install-test' }
+          $headers = @{
+            'User-Agent'    = 'ecal-mcp-install-test'
+            'Authorization' = "Bearer $env:GH_API_TOKEN"
+          }
           $tag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/zpg6/ecal-mcp/releases/latest' -Headers $headers).tag_name
           if (-not $tag) { throw "could not resolve latest tag" }
 

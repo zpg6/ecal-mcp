@@ -1,0 +1,69 @@
+# eCAL configuration for the realnet (cross-container) e2e suite.
+#
+# Forces "real network" semantics:
+#   - communication_mode = network          → registration goes out via UDP
+#                                             multicast on 239.0.0.1, *not* the
+#                                             host-local SHM registration path.
+#   - subscribers disable UDP and SHM       → cross-host data MUST traverse TCP,
+#                                             which is what we want to validate
+#                                             (and what most production users
+#                                             land on for non-trivial payloads).
+#   - shm_transport_domain left default     → distinct per container hostname,
+#                                             so ecal_diagnose_topic's "cross-
+#                                             host SHM-domain" code path is
+#                                             actually exercised.
+#
+# Both the publisher container and the MCP container mount this same file at
+# /home/ecal/.ecal/ecal.yaml.
+
+communication_mode: "network"
+
+registration:
+  registration_refresh: 1000
+  registration_timeout: 10000
+  loopback: true
+  shm_transport_domain: ""
+  local:
+    transport_type: "udp"
+  network:
+    transport_type: "udp"
+
+transport_layer:
+  udp:
+    config_version: "v2"
+    port: 14002
+    mask: "255.255.255.240"
+    send_buffer: 5242880
+    receive_buffer: 5242880
+    join_all_interfaces: false
+    npcap_enabled: false
+    local:
+      group: "127.255.255.255"
+      ttl: 1
+    network:
+      group: "239.0.0.1"
+      ttl: 1
+  tcp:
+    number_executor_reader: 4
+    number_executor_writer: 4
+    max_reconnections: 5
+
+publisher:
+  layer:
+    shm:
+      enable: true
+    udp:
+      enable: true
+    tcp:
+      enable: true
+  priority_local:   ["shm", "udp", "tcp"]
+  priority_network: ["tcp", "udp"]
+
+subscriber:
+  layer:
+    shm:
+      enable: false
+    udp:
+      enable: false
+    tcp:
+      enable: true

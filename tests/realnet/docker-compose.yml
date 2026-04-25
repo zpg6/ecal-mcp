@@ -1,0 +1,90 @@
+# Realnet e2e topology.
+#
+# Two containers on a user-defined bridge network so they get distinct
+# hostnames (→ distinct eCAL shm_transport_domain values) and Docker's
+# embedded DNS resolves each peer by name. UDP multicast on 239.0.0.1 is
+# forwarded between containers on the same Linux bridge, which is what eCAL's
+# network-mode registration relies on. Topic data is forced over TCP via the
+# mounted ecal.yaml.
+#
+# Reuses the image built by the existing `make image` step — no extra build.
+#
+# IMPORTANT: every `command:` here is a YAML list, not a string. Compose's
+# string form gets word-split before being handed to the entrypoint, which
+# would tear apart the multi-line shell script.
+
+name: ecal-mcp-realnet
+
+networks:
+  ecalnet:
+    driver: bridge
+
+services:
+  # ---- Publisher / service-server side ---------------------------------------
+  pub:
+    image: ${ECAL_MCP_IMAGE:-ecal-mcp:e2e}
+    hostname: ecal-pub
+    container_name: ecal-mcp-realnet-pub
+    networks: [ecalnet]
+    shm_size: 256m
+    volumes:
+      - ./ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+    entrypoint: ["/bin/sh", "-c"]
+    # Background the deterministic helper publishers + service server, then
+    # idle. The protobuf "person" sample ships in the eCAL .deb but the
+    # binary name moved from `_snd` to `_send` in eCAL 6.1, so we probe for
+    # both and skip cleanly if neither is present.
+    command:
+      - |
+        set -eu
+        echo "[pub] starting helpers on $$(hostname)"
+        /usr/local/bin/ecal-test-publisher \
+            --topic ecal_mcp_realnet_pub \
+            --prefix realnet \
+            --interval-ms 100 &
+        /usr/local/bin/ecal-test-service-server \
+            --service ecal_mcp_realnet_service &
+        if command -v ecal_sample_person_send >/dev/null 2>&1; then
+            echo "[pub] starting ecal_sample_person_send"
+            ecal_sample_person_send &
+        elif command -v ecal_sample_person_snd >/dev/null 2>&1; then
+            echo "[pub] starting ecal_sample_person_snd (legacy name)"
+            ecal_sample_person_snd &
+        else
+            echo "[pub] WARN: no person sample binary; protobuf checks will skip"
+        fi
+        exec tail -f /dev/null
+
+  # ---- MCP side --------------------------------------------------------------
+  mcp:
+    image: ${ECAL_MCP_IMAGE:-ecal-mcp:e2e}
+    hostname: ecal-mcp
+    container_name: ecal-mcp-realnet-mcp
+    networks: [ecalnet]
+    shm_size: 256m
+    volumes:
+      - ./ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+    depends_on: [pub]
+    entrypoint: ["/bin/sh", "-c"]
+    # Co-locate a second `ecal-test-publisher` on the MCP host. Same
+    # topic name as `pub`'s publisher, distinct prefix + rate, so the
+    # realnet suite gets a multi-publisher cross-host topology:
+    #   * `pub`  → "realnet"     @ 10 Hz
+    #   * `mcp`  → "realnet-mcp" @  5 Hz
+    # This unlocks coverage that single-publisher topologies can't:
+    # ecal_list_publishers returning ≥2 entries on the same topic with
+    # distinct host_name/topic_id, ecal_diagnose_topic with N>1 pubs
+    # across distinct hosts, ecal_topic_stats over a combined rate, and
+    # ecal_subscribe receiving an interleaved stream from both.
+    command:
+      - |
+        set -eu
+        echo "[mcp] starting local publisher on $$(hostname)"
+        /usr/local/bin/ecal-test-publisher \
+            --topic ecal_mcp_realnet_pub \
+            --prefix realnet-mcp \
+            --interval-ms 200 &
+        echo "[mcp] idle; use 'docker compose exec mcp ecal-mcp'"
+        exec tail -f /dev/null
+    stdin_open: true
+    tty: false

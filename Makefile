@@ -1,7 +1,7 @@
 IMAGE_TAG ?= ecal-mcp:e2e
 BUILDER_TAG ?= ecal-mcp:builder
 
-.PHONY: build image builder-image test e2e shell clean
+.PHONY: build image builder-image test e2e e2e-realnet shell clean
 
 build:
 	cargo build --release --bins
@@ -23,6 +23,14 @@ test: builder-image
 
 e2e:
 	ECAL_MCP_IMAGE=$(IMAGE_TAG) python3 tests/e2e.py
+
+# Cross-container ("realnet") e2e: two containers on a user-defined Docker
+# bridge with eCAL in network mode + TCP transport. Validates code paths the
+# single-container e2e structurally cannot reach (cross-host transport
+# selection, real protobuf descriptors via the bundled person sample, and the
+# cross-host shm_transport_domain finding in ecal_diagnose_topic).
+e2e-realnet: image
+	ECAL_MCP_IMAGE=$(IMAGE_TAG) python3 tests/e2e_realnet.py
 
 # Open an interactive shell inside the runtime image (useful for debugging).
 shell:
