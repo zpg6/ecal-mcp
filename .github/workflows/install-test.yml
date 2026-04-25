@@ -144,10 +144,16 @@ jobs:
             Get-Content $installer -TotalCount 5 | Out-Host
             throw "downloaded $exeName looks too small ($size bytes) -- likely an HTML error page"
           }
-          Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
 
-          if (-not (Test-Path 'C:\eCAL')) { throw "expected eCAL install at C:\eCAL" }
-          'C:\eCAL\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+          # Extract via 7z (NSIS silent install hangs on CI runners).
+          $ecalHome = 'C:\eCAL'
+          New-Item -ItemType Directory -Path $ecalHome -Force | Out-Null
+          7z x $installer "-o$ecalHome" -y -bso0 -bsp0
+          if (-not (Test-Path "$ecalHome\bin")) {
+            Get-ChildItem $ecalHome | Out-Host
+            throw "expected $ecalHome\bin after extracting $exeName"
+          }
+          "$ecalHome\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Run published install.ps1
         shell: pwsh

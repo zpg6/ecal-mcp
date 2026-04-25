@@ -136,7 +136,9 @@ jobs:
           curl -sSL -o /tmp/ecal.deb "$deb_url"
           sudo apt-get install -y --no-install-recommends /tmp/ecal.deb
 
-      # ----- Windows: install eCAL via NSIS installer + protoc -----------------
+      # ----- Windows: extract eCAL .exe via 7z (NSIS silent install hangs on
+      # CI runners). Also fetch a protoc release zip directly (avoids the slow
+      # choco install path).
       - name: Install eCAL + protoc (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -166,15 +168,31 @@ jobs:
             throw "downloaded $exeName looks too small ($size bytes) -- likely an HTML error page"
           }
 
-          # NSIS silent install. eCAL defaults to C:\eCAL.
-          Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
-
+          # Extract the NSIS installer's contents directly. NSIS installs hang
+          # on the runner; 7z reads the same archive in seconds and gives us
+          # the bin/include/lib trees rustecal-sys needs.
           $ecalHome = 'C:\eCAL'
-          if (-not (Test-Path $ecalHome)) { throw "expected eCAL install at $ecalHome" }
-          "ECAL_HOME=$ecalHome"        | Out-File -FilePath $env:GITHUB_ENV -Append
-          "$ecalHome\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
+          New-Item -ItemType Directory -Path $ecalHome -Force | Out-Null
+          7z x $installer "-o$ecalHome" -y -bso0 -bsp0
+          if (-not (Test-Path "$ecalHome\bin")) {
+            Get-ChildItem $ecalHome | Out-Host
+            throw "expected $ecalHome\bin after extracting $exeName"
+          }
+          Remove-Item -Recurse -Force "$ecalHome\`$PLUGINSDIR" -ErrorAction SilentlyContinue
+          "ECAL_HOME=$ecalHome" | Out-File -FilePath $env:GITHUB_ENV   -Append
+          "$ecalHome\bin"       | Out-File -FilePath $env:GITHUB_PATH  -Append
 
-          choco install -y protoc
+          # protoc: official release zip -> $RUNNER_TEMP\protoc\bin\protoc.exe
+          $protocVer  = '25.1'
+          $protocZip  = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          $protocDir  = Join-Path $env:RUNNER_TEMP 'protoc'
+          Invoke-WebRequest `
+            -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVer/protoc-$protocVer-win64.zip" `
+            -OutFile $protocZip `
+            -MaximumRetryCount 5 `
+            -RetryIntervalSec 5
+          Expand-Archive -Path $protocZip -DestinationPath $protocDir -Force
+          "$protocDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
