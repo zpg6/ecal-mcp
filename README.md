@@ -4,34 +4,69 @@ A local **Model Context Protocol** server that exposes [Eclipse eCAL](https://gi
 
 It is a **single native binary** that joins the eCAL network on the host like any other eCAL process. No daemons, no sidecars.
 
-## Install & run
+## Install
 
-You need the **eCAL v6 runtime** already installed on the host (the same way every other eCAL participant on that machine has it). Then:
+You need the **eCAL v6 runtime** already installed on the host (the same way every other eCAL participant on that machine has it). Grab the matching package from <https://github.com/eclipse-ecal/ecal/releases>:
+
+- **Linux:** `apt-get install ./ecal_<ver>-jammy_<arch>.deb`
+- **Windows:** run the `ecal_<ver>-win64.exe` installer (default install path `C:\eCAL`)
+
+Then either grab a prebuilt `ecal-mcp` binary or build from source.
+
+### Prebuilt binary (recommended)
+
+Linux / macOS:
 
 ```bash
-git clone https://github.com/<you>/ecal-mcp && cd ecal-mcp
-cargo build --release
-./target/release/ecal-mcp     # speaks MCP over stdio
+curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
 ```
 
-Build prerequisites: a Rust toolchain and `clang` / `libclang` (`bindgen` needs it). On Ubuntu 22.04 that's:
+Windows (PowerShell):
+
+```powershell
+irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
+```
+
+Each script detects your architecture, resolves the latest GitHub Release, verifies the `.sha256`, and installs `ecal-mcp` to a sensible default (`/usr/local/bin` on Linux, `%LOCALAPPDATA%\Programs\ecal-mcp\bin` on Windows — added to user `PATH`). Override with env vars:
+
+```bash
+ECAL_MCP_VERSION=v0.2.0 ECAL_MCP_PREFIX=$HOME/.local \
+  curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
+```
+
+```powershell
+$env:ECAL_MCP_VERSION='v0.2.0'; $env:ECAL_MCP_PREFIX="$HOME\ecal-mcp"
+irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
+```
+
+Released targets (each ships with a matching `.sha256`):
+
+| Target | Archive |
+|---|---|
+| Linux x86_64 | `ecal-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `ecal-mcp-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `ecal-mcp-<version>-x86_64-pc-windows-msvc.zip` |
+
+macOS is not yet covered by the release matrix — build from source there.
+
+### Build from source
 
 ```bash
 sudo apt-get install -y clang libclang-14-dev llvm-dev protobuf-compiler
-# eCAL v6 runtime: download the matching .deb from
-#   https://github.com/eclipse-ecal/ecal/releases
-# and `apt-get install ./that.deb`
+git clone https://github.com/zpg6/ecal-mcp && cd ecal-mcp
+cargo build --release --bin ecal-mcp
+./target/release/ecal-mcp
 ```
 
-### Wire it into an MCP client
+## Wire it into an MCP client
 
-Point your client at the compiled binary. For example, in a Cursor / Claude Desktop config:
+Point your client at the binary. For example, in a Cursor / Claude Desktop config:
 
 ```json
 {
   "mcpServers": {
     "ecal": {
-      "command": "/absolute/path/to/ecal-mcp"
+      "command": "/usr/local/bin/ecal-mcp"
     }
   }
 }

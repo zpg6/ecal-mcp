@@ -1,0 +1,259 @@
+name: release
+
+# Strategy: every push to `main` checks whether `Cargo.toml`'s version was
+# bumped relative to the parent commit. If it was bumped *and* the new value
+# is strictly higher (semver-sorted) than the old one, we tag `v<version>`,
+# build release binaries for every supported target, and publish them to a
+# GitHub Release. No crates.io publish — that comes later.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force a release at this version (skip the bump check)."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  ECAL_VERSION: v6.1.1
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Detect a version bump in Cargo.toml.
+  # -------------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.diff.outputs.version }}
+      bumped: ${{ steps.diff.outputs.bumped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the parent commit to diff Cargo.toml against.
+          fetch-depth: 2
+
+      - id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          extract_version() {
+            grep -m1 -E '^version[[:space:]]*=' "$1" \
+              | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/'
+          }
+
+          new=$(extract_version Cargo.toml)
+          echo "version=$new" >>"$GITHUB_OUTPUT"
+          echo "current Cargo.toml version: $new"
+
+          forced="${{ github.event.inputs.force_version }}"
+          if [[ -n "$forced" ]]; then
+            if [[ "$forced" != "$new" ]]; then
+              echo "force_version=$forced does not match Cargo.toml version=$new" >&2
+              exit 1
+            fi
+            echo "manual dispatch — releasing $new unconditionally"
+            echo "bumped=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git show HEAD~1:Cargo.toml >/tmp/prev.toml 2>/dev/null; then
+            old=$(extract_version /tmp/prev.toml || true)
+          else
+            old=""
+          fi
+          echo "previous Cargo.toml version: ${old:-<none>}"
+
+          if [[ -z "$new" ]]; then
+            echo "no version found in Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "$new" == "$old" ]]; then
+            echo "no version change; skipping release"
+            echo "bumped=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Strictly-higher check via `sort -V` (semver-aware).
+          higher=$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n1)
+          if [[ "$higher" != "$new" ]]; then
+            echo "Cargo.toml version went *down* ($old -> $new); refusing to release" >&2
+            echo "bumped=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "version bumped: $old -> $new"
+          echo "bumped=true" >>"$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------------
+  # 2. Build release binaries for every supported target.
+  # -------------------------------------------------------------------------
+  build:
+    needs: detect
+    if: needs.detect.outputs.bumped == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ecal_deb: jammy_amd64
+            libclang_pkg: libclang-14-dev
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            ecal_deb: jammy_arm64
+            libclang_pkg: libclang-14-dev
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Linux: install build deps + eCAL .deb ------------------------------
+      - name: Install build deps + eCAL (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl jq pkg-config build-essential \
+            clang ${{ matrix.libclang_pkg }} llvm-dev \
+            protobuf-compiler
+
+          version_num="${ECAL_VERSION#v}"
+          deb_name="ecal_${version_num}-${{ matrix.ecal_deb }}.deb"
+          deb_url=$(curl -sSL \
+            "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/${ECAL_VERSION}" \
+            | jq -r --arg name "$deb_name" \
+              '.assets[] | select(.name == $name) | .browser_download_url')
+          test -n "$deb_url" && test "$deb_url" != "null"
+          curl -sSL -o /tmp/ecal.deb "$deb_url"
+          sudo apt-get install -y --no-install-recommends /tmp/ecal.deb
+
+      # ----- Windows: install eCAL via NSIS installer + protoc -----------------
+      - name: Install eCAL + protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:ECAL_VERSION
+          $verNum  = $version.TrimStart('v')
+          $exeName = "ecal_${verNum}-win64.exe"
+
+          $headers = @{ 'User-Agent' = 'ecal-mcp-ci' }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/$version" `
+            -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -eq $exeName }
+          if (-not $asset) { throw "asset $exeName not found in $version" }
+
+          $installer = Join-Path $env:RUNNER_TEMP $exeName
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers $headers
+
+          # NSIS silent install. eCAL defaults to C:\eCAL.
+          Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
+
+          $ecalHome = 'C:\eCAL'
+          if (-not (Test-Path $ecalHome)) { throw "expected eCAL install at $ecalHome" }
+          "ECAL_HOME=$ecalHome"        | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$ecalHome\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
+
+          choco install -y protoc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --bin ecal-mcp --locked --target ${{ matrix.target }}
+
+      # ----- Package (Linux: tar.gz, Windows: zip) ------------------------------
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          version="${{ needs.detect.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="dist/ecal-mcp-${version}-${target}"
+          mkdir -p "$stage"
+          cp target/${target}/release/ecal-mcp "$stage/"
+          cp README.md LICENSE* "$stage/" 2>/dev/null || true
+          tar -C dist -czf "ecal-mcp-${version}-${target}.tar.gz" "ecal-mcp-${version}-${target}"
+          sha256sum "ecal-mcp-${version}-${target}.tar.gz" \
+            > "ecal-mcp-${version}-${target}.tar.gz.sha256"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ needs.detect.outputs.version }}'
+          $target  = '${{ matrix.target }}'
+          $stem    = "ecal-mcp-$version-$target"
+          $stage   = Join-Path 'dist' $stem
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target\$target\release\ecal-mcp.exe" $stage
+          Get-ChildItem -Path . -Include 'README.md','LICENSE*' -File `
+            | ForEach-Object { Copy-Item $_.FullName $stage }
+
+          $zip = "$stem.zip"
+          if (Test-Path $zip) { Remove-Item $zip }
+          Compress-Archive -Path $stage -DestinationPath $zip
+
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$hash  $zip" | Out-File -Encoding ascii "$zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: ecal-mcp-${{ matrix.target }}
+          path: |
+            ecal-mcp-${{ needs.detect.outputs.version }}-${{ matrix.target }}.tar.gz
+            ecal-mcp-${{ needs.detect.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ecal-mcp-${{ matrix.target }}
+          path: |
+            ecal-mcp-${{ needs.detect.outputs.version }}-${{ matrix.target }}.zip
+            ecal-mcp-${{ needs.detect.outputs.version }}-${{ matrix.target }}.zip.sha256
+
+  # -------------------------------------------------------------------------
+  # 3. Tag + publish a GitHub release with all artifacts.
+  # -------------------------------------------------------------------------
+  release:
+    needs: [detect, build]
+    if: needs.detect.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          tag="v${{ needs.detect.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "$tag" \
+              --generate-notes \
+              --target "${{ github.sha }}"
+          fi
