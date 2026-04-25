@@ -1,0 +1,40 @@
+[package]
+name = "ecal-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Local MCP server exposing the Eclipse eCAL middleware via the rustecal binding"
+license = "Apache-2.0"
+
+[[bin]]
+name = "ecal-mcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "ecal-test-publisher"
+path = "src/bin/test_publisher.rs"
+
+[[bin]]
+name = "ecal-test-service-server"
+path = "src/bin/test_service_server.rs"
+
+[dependencies]
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
+rustecal = "0.1"
+rustecal-core = "0.1"
+rustecal-pubsub = "0.1"
+rustecal-service = "0.1"
+rustecal-types-string = "0.1"
+rustecal-types-bytes = "0.1"
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "time"] }
+anyhow = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
