@@ -1,0 +1,197 @@
+name: install-test
+
+# Smoke-tests the published install scripts against the latest GitHub Release
+# on real Linux + Windows runners. For each platform we:
+#   1. Install the eCAL v6 runtime (the binary's only host prerequisite).
+#   2. Run our published install one-liner.
+#   3. Assert the binary lands at the documented default path.
+#   4. Drive an MCP `initialize` handshake over stdio and assert the server
+#      identifies itself as `ecal-mcp` -- proving the binary actually loaded
+#      eCAL and started speaking the protocol.
+#
+# Triggers:
+#   - push to main that touches the install scripts (or this workflow itself)
+#     -- catches regressions before they ship to users via Pages;
+#   - automatically after `release.yml` finishes (post-release smoke check);
+#   - on demand via workflow_dispatch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - install.ps1
+      - .github/workflows/install-test.yml
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ECAL_VERSION: v6.1.1
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Linux: bash one-liner
+  # -------------------------------------------------------------------------
+  linux:
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            ecal_deb: jammy_amd64
+          - os: ubuntu-22.04-arm
+            ecal_deb: jammy_arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install eCAL runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl jq
+
+          version_num="${ECAL_VERSION#v}"
+          deb_name="ecal_${version_num}-${{ matrix.ecal_deb }}.deb"
+          deb_url=$(curl -sSL \
+            "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/${ECAL_VERSION}" \
+            | jq -r --arg name "$deb_name" \
+              '.assets[] | select(.name == $name) | .browser_download_url')
+          test -n "$deb_url" && test "$deb_url" != "null"
+          curl -sSL -o /tmp/ecal.deb "$deb_url"
+          sudo apt-get install -y --no-install-recommends /tmp/ecal.deb
+
+      - name: Run published install.sh
+        shell: bash
+        run: curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
+
+      - name: Assert binary at documented default path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -x /usr/local/bin/ecal-mcp
+          ldd /usr/local/bin/ecal-mcp | (! grep -i 'not found') || {
+            echo "ecal-mcp has unresolved shared libraries:" >&2
+            ldd /usr/local/bin/ecal-mcp >&2
+            exit 1
+          }
+
+      - name: MCP initialize handshake
+        shell: bash
+        run: |
+          set -euo pipefail
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}'
+          out=$(printf '%s\n' "$req" | timeout 10 /usr/local/bin/ecal-mcp 2>/tmp/ecal-mcp.stderr | head -n1 || true)
+          echo "raw response: $out"
+          test -n "$out" || { echo "no MCP response on stdout"; cat /tmp/ecal-mcp.stderr; exit 1; }
+          name=$(echo "$out" | jq -er .result.serverInfo.name)
+          test "$name" = "ecal-mcp" || { echo "unexpected serverInfo.name: $name"; exit 1; }
+          echo "OK: server reports $(echo "$out" | jq -r '.result.serverInfo | "\(.name) \(.version)"')"
+
+      - name: Re-install with version + prefix overrides
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Resolve "latest" tag explicitly so we test the pinned-version code path.
+          tag=$(curl -fsSL https://api.github.com/repos/zpg6/ecal-mcp/releases/latest | jq -r .tag_name)
+          test -n "$tag" && test "$tag" != "null"
+
+          ECAL_MCP_VERSION="$tag" ECAL_MCP_PREFIX="$HOME/.local" \
+            bash -c 'curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash'
+
+          test -x "$HOME/.local/bin/ecal-mcp"
+
+  # -------------------------------------------------------------------------
+  # Windows: PowerShell one-liner
+  # -------------------------------------------------------------------------
+  windows:
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-2022
+    steps:
+      - name: Install eCAL runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:ECAL_VERSION
+          $verNum  = $version.TrimStart('v')
+          $exeName = "ecal_${verNum}-win64.exe"
+
+          $headers = @{ 'User-Agent' = 'ecal-mcp-install-test' }
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/$version" `
+            -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -eq $exeName }
+          if (-not $asset) { throw "asset $exeName not found in $version" }
+
+          $installer = Join-Path $env:RUNNER_TEMP $exeName
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers $headers
+          Start-Process -FilePath $installer -ArgumentList '/S' -NoNewWindow -Wait
+
+          if (-not (Test-Path 'C:\eCAL')) { throw "expected eCAL install at C:\eCAL" }
+          'C:\eCAL\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Run published install.ps1
+        shell: pwsh
+        run: irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
+
+      - name: Assert binary at documented default path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\ecal-mcp\bin\ecal-mcp.exe'
+          if (-not (Test-Path $exe)) { throw "expected $exe" }
+          Get-Item $exe | Format-List FullName,Length,LastWriteTime
+
+      - name: MCP initialize handshake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\ecal-mcp\bin\ecal-mcp.exe'
+          $req = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"install-test","version":"0"}}}'
+
+          $psi = [System.Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName               = $exe
+          $psi.UseShellExecute        = $false
+          $psi.RedirectStandardInput  = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError  = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          $proc.StandardInput.WriteLine($req)
+          $proc.StandardInput.Close()
+
+          $readTask = $proc.StandardOutput.ReadLineAsync()
+          $line = if ($readTask.Wait(10000)) { $readTask.Result } else { $null }
+          if (-not $proc.HasExited) { $proc.Kill() | Out-Null; $proc.WaitForExit() }
+
+          $stderr = $proc.StandardError.ReadToEnd()
+          Write-Host "raw response: $line"
+          if (-not $line) { Write-Host "stderr:`n$stderr"; throw "no MCP response on stdout" }
+
+          $resp = $line | ConvertFrom-Json
+          $name = $resp.result.serverInfo.name
+          if ($name -ne 'ecal-mcp') { throw "unexpected serverInfo.name: $name" }
+          Write-Host "OK: server reports $($resp.result.serverInfo.name) $($resp.result.serverInfo.version)"
+
+      - name: Re-install with version + prefix overrides
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ 'User-Agent' = 'ecal-mcp-install-test' }
+          $tag = (Invoke-RestMethod -Uri 'https://api.github.com/repos/zpg6/ecal-mcp/releases/latest' -Headers $headers).tag_name
+          if (-not $tag) { throw "could not resolve latest tag" }
+
+          $env:ECAL_MCP_VERSION = $tag
+          $env:ECAL_MCP_PREFIX  = Join-Path $HOME 'ecal-mcp-alt'
+          irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
+
+          $exe = Join-Path $env:ECAL_MCP_PREFIX 'bin\ecal-mcp.exe'
+          if (-not (Test-Path $exe)) { throw "expected $exe after override install" }
