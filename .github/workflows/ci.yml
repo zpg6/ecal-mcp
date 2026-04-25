@@ -1,0 +1,96 @@
+name: ci
+
+# Runs on every PR + every push to main. Two jobs in parallel:
+#
+#   1. lint  - rustfmt; ~10s once Rust is provisioned.
+#   2. test  - builds the Dockerfile (builder + runtime stages) with GHA layer
+#              cache, runs `cargo test --bin ecal-mcp` against the cached
+#              builder image, then drives tests/e2e.py against the runtime
+#              image (30 e2e cases).
+#
+# Speed tactics:
+#   - docker/build-push-action with `cache-from`/`cache-to: type=gha` so apt
+#     deps, the eCAL deb, and the cargo-deps build are all restored on cache
+#     hit. First run on a branch is slow (~7-10 min); subsequent runs that
+#     don't touch Cargo.toml/Cargo.lock should land in 1-3 min.
+#   - concurrency group cancels superseded runs on the same PR.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Builder stage = Ubuntu + Rust + eCAL + cached cargo dep-build.
+      # Used to run unit tests in the same toolchain as the release build.
+      - name: Build builder image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          target: builder
+          tags: ecal-mcp:builder
+          cache-from: type=gha,scope=ecal-mcp-builder
+          cache-to:   type=gha,scope=ecal-mcp-builder,mode=max
+
+      # Mount only `src/` over the stubs baked into the builder image so we
+      # reuse the prebuilt /build/target/release dep cache and skip rebuilding
+      # ~hundreds of crates from scratch.
+      - name: Unit tests (cargo test --release --bin ecal-mcp)
+        run: |
+          docker run --rm \
+            -v "$PWD/src:/build/src:ro" \
+            -v "$PWD/Cargo.toml:/build/Cargo.toml:ro" \
+            -v "$PWD/Cargo.lock:/build/Cargo.lock:ro" \
+            -w /build \
+            ecal-mcp:builder \
+            cargo test --release --bin ecal-mcp --locked
+
+      # Runtime stage. Reuses the builder cache scope above for the cargo
+      # build layer, plus its own scope for the runtime apt + eCAL deb.
+      - name: Build runtime image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ecal-mcp:e2e
+          cache-from: |
+            type=gha,scope=ecal-mcp-builder
+            type=gha,scope=ecal-mcp-runtime
+          cache-to: type=gha,scope=ecal-mcp-runtime,mode=max
+
+      - name: e2e suite (tests/e2e.py)
+        env:
+          ECAL_MCP_IMAGE: ecal-mcp:e2e
+        run: python3 tests/e2e.py
