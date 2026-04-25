@@ -1,6 +1,6 @@
 [package]
 name = "ecal-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Local MCP server exposing the Eclipse eCAL middleware via the rustecal binding"
 license = "Apache-2.0"
