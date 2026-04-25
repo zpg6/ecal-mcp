@@ -118,6 +118,8 @@ jobs:
       - name: Install build deps + eCAL (Linux)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -128,7 +130,7 @@ jobs:
 
           version_num="${ECAL_VERSION#v}"
           deb_name="ecal_${version_num}-${{ matrix.ecal_deb }}.deb"
-          deb_url=$(curl -sSL \
+          deb_url=$(curl -sSL -H "Authorization: Bearer $GH_API_TOKEN" \
             "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/${ECAL_VERSION}" \
             | jq -r --arg name "$deb_name" \
               '.assets[] | select(.name == $name) | .browser_download_url')
@@ -142,13 +144,18 @@ jobs:
       - name: Install eCAL + protoc (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:ECAL_VERSION
           $verNum  = $version.TrimStart('v')
           $exeName = "ecal_${verNum}-win64.exe"
 
-          $headers = @{ 'User-Agent' = 'ecal-mcp-ci' }
+          $headers = @{
+            'User-Agent'    = 'ecal-mcp-ci'
+            'Authorization' = "Bearer $env:GH_API_TOKEN"
+          }
           $release = Invoke-RestMethod `
             -Uri "https://api.github.com/repos/eclipse-ecal/ecal/releases/tags/$version" `
             -Headers $headers

@@ -64,7 +64,13 @@ bin="$tmp/${stem}/ecal-mcp"
 [[ -x "$bin" ]] || err "extracted archive missing executable at $bin"
 
 dest_dir="${prefix}/bin"
-if [[ -w "$dest_dir" ]] || { [[ -w "$prefix" ]] && [[ ! -e "$dest_dir" ]]; }; then
+# Use sudo only if we can't write into dest_dir ourselves. `install -m -d`
+# tries to chmod the target dir, which fails on existing system dirs we
+# don't own (e.g. runner-writable /usr/local/bin). So only create the dir
+# when missing, and skip the chmod-during-create when it already exists.
+if [[ -d "$dest_dir" && -w "$dest_dir" ]]; then
+  install -m 0755 "$bin" "$dest_dir/ecal-mcp"
+elif [[ ! -e "$dest_dir" && -w "$prefix" ]]; then
   install -m 0755 -d "$dest_dir"
   install -m 0755 "$bin" "$dest_dir/ecal-mcp"
 else
