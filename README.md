@@ -6,10 +6,20 @@ It is a **single native binary** that joins the eCAL network on the host like an
 
 ## Install
 
-You need the **eCAL v6 runtime** already installed on the host (the same way every other eCAL participant on that machine has it). Grab the matching package from <https://github.com/eclipse-ecal/ecal/releases>:
+You need the **eCAL v6 runtime** already installed on the host (the same way every other eCAL participant on that machine has it). Follow the [official eCAL setup guide](https://eclipse-ecal.github.io/ecal/stable/getting_started/setup.html) — the short version:
 
-- **Linux:** `apt-get install ./ecal_<ver>-jammy_<arch>.deb`
-- **Windows:** run the `ecal_<ver>-win64.exe` installer (default install path `C:\eCAL`)
+- **Ubuntu (recommended, via PPA):**
+
+```bash
+sudo add-apt-repository ppa:ecal/ecal-latest
+sudo apt-get update
+sudo apt-get install ecal
+```
+
+- **Ubuntu (manual `.deb`):** download the matching package from the [eCAL releases page](https://eclipse-ecal.github.io/ecal/releases/) and run `sudo apt install ./ecal_*.deb`.
+- **Windows:** download the installer from the [eCAL releases page](https://eclipse-ecal.github.io/ecal/releases/) and install with default (Full) options. Default install path is `C:\eCAL`.
+
+Other platforms (or unsupported distros) — see [Building eCAL from source](https://eclipse-ecal.github.io/ecal/stable/development/building_ecal_from_source.html).
 
 Then either grab a prebuilt `ecal-mcp` binary or build from source.
 
@@ -41,11 +51,11 @@ irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
 
 Released targets (each ships with a matching `.sha256`):
 
-| Target | Archive |
-|---|---|
-| Linux x86_64 | `ecal-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `ecal-mcp-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `ecal-mcp-<version>-x86_64-pc-windows-msvc.zip` |
+| Target         | Archive                                               |
+| -------------- | ----------------------------------------------------- |
+| Linux x86_64   | `ecal-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz`  |
+| Linux aarch64  | `ecal-mcp-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `ecal-mcp-<version>-x86_64-pc-windows-msvc.zip`       |
 
 macOS is not yet covered by the release matrix — build from source there.
 
@@ -71,18 +81,18 @@ cargo build --release --bin ecal-mcp
 
 ## Tools
 
-| Tool | Purpose |
-|---|---|
-| `ecal_diagnose_topic` | **Start here when a topic isn't behaving.** Combines a monitoring snapshot (publishers, subscribers, type signatures, transport layers, SHM domains, process health) with a live measurement window and emits a `findings` list naming the actual anomaly: missing publisher / subscriber, metadata mismatch, no shared active transport, cross-host SHM-domain split, ongoing message drops, non-healthy producer process. When the topic doesn't exist at all, `similar_topics` lists the closest known names to catch typos. |
-| `ecal_topic_stats` | Subscribe for `duration_ms` and report measured rate, payload size min/mean/max, inter-arrival gap min/mean/max, and gap stddev (jitter). The honest answer to "what's actually on the wire?" — independent of the cached `data_frequency` field. |
-| `ecal_list_publishers` | Snapshot every publisher (topic, data type, transport layers, host, SHM domain, traffic stats, `data_id`/`data_clock`/`registration_clock`). Accepts `name_pattern` and `type_name_pattern` (case-insensitive substring) and `include_descriptors` (opt-in base-64 type descriptor blobs, off by default — they can be tens of KB each). |
-| `ecal_list_subscribers` | Same shape and filtering as publishers. |
-| `ecal_list_services` / `ecal_list_service_clients` | Service servers (with method signatures + call counts) and the clients calling them. Both accept `name_pattern`. |
-| `ecal_list_processes` | Live eCAL processes with state, runtime version, and `config_file_path`. Accepts `name_pattern` against `unit_name` / `process_name`. |
-| `ecal_get_logs` | Drain pending eCAL log messages with optional `min_level` (`debug4 < debug3 < debug2 < debug1 < info < warning < error < fatal`), `since_timestamp_us`, and `process_name_pattern` filters. |
-| `ecal_publish` | One-shot publish (`text` for `StringMessage`, `payload_base64` for `BytesMessage`). Polls for ≥1 subscriber up to `discovery_wait_ms` so the first send actually lands. |
-| `ecal_subscribe` | Listen on a topic for a fixed window and return up to N samples (UTF-8 + base-64, per-sample `topic_name`). |
-| `ecal_call_service` | Call a method on every discovered server, returning each server's identity (`server_entity_id`, `server_process_id`, `server_host_name`) and response. Pass `target_server_entity_id` to drive exactly one replica; `discovered_instances` is preserved separately from filtered `instances`. |
+| Tool                                               | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ecal_diagnose_topic`                              | **Start here when a topic isn't behaving.** Combines a monitoring snapshot (publishers, subscribers, type signatures, transport layers, SHM domains, process health) with a live measurement window and emits a `findings` list naming the actual anomaly: missing publisher / subscriber, metadata mismatch, no shared active transport, cross-host SHM-domain split, ongoing message drops, non-healthy producer process. When the topic doesn't exist at all, `similar_topics` lists the closest known names to catch typos. |
+| `ecal_topic_stats`                                 | Subscribe for `duration_ms` and report measured rate, payload size min/mean/max, inter-arrival gap min/mean/max, and gap stddev (jitter). The honest answer to "what's actually on the wire?" — independent of the cached `data_frequency` field.                                                                                                                                                                                                                                                                               |
+| `ecal_list_publishers`                             | Snapshot every publisher (topic, data type, transport layers, host, SHM domain, traffic stats, `data_id`/`data_clock`/`registration_clock`). Accepts `name_pattern` and `type_name_pattern` (case-insensitive substring) and `include_descriptors` (opt-in base-64 type descriptor blobs, off by default — they can be tens of KB each).                                                                                                                                                                                        |
+| `ecal_list_subscribers`                            | Same shape and filtering as publishers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `ecal_list_services` / `ecal_list_service_clients` | Service servers (with method signatures + call counts) and the clients calling them. Both accept `name_pattern`.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `ecal_list_processes`                              | Live eCAL processes with state, runtime version, and `config_file_path`. Accepts `name_pattern` against `unit_name` / `process_name`.                                                                                                                                                                                                                                                                                                                                                                                           |
+| `ecal_get_logs`                                    | Drain pending eCAL log messages with optional `min_level` (`debug4 < debug3 < debug2 < debug1 < info < warning < error < fatal`), `since_timestamp_us`, and `process_name_pattern` filters.                                                                                                                                                                                                                                                                                                                                     |
+| `ecal_publish`                                     | One-shot publish (`text` for `StringMessage`, `payload_base64` for `BytesMessage`). Polls for ≥1 subscriber up to `discovery_wait_ms` so the first send actually lands.                                                                                                                                                                                                                                                                                                                                                         |
+| `ecal_subscribe`                                   | Listen on a topic for a fixed window and return up to N samples (UTF-8 + base-64, per-sample `topic_name`).                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ecal_call_service`                                | Call a method on every discovered server, returning each server's identity (`server_entity_id`, `server_process_id`, `server_host_name`) and response. Pass `target_server_entity_id` to drive exactly one replica; `discovered_instances` is preserved separately from filtered `instances`.                                                                                                                                                                                                                                   |
 
 All inputs and outputs use JSON Schemas generated by `schemars`, so MCP clients see fully typed tool definitions.
 
