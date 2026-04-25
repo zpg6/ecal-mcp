@@ -145,13 +145,31 @@ jobs:
             throw "downloaded $exeName looks too small ($size bytes) -- likely an HTML error page"
           }
 
-          # Extract via 7z (NSIS silent install hangs on CI runners).
+          # eCAL ships an Inno Setup installer; use its real silent flags
+          # ('/S' is NSIS-only and just pops a UI dialog the runner can't
+          # dismiss).
           $ecalHome = 'C:\eCAL'
-          New-Item -ItemType Directory -Path $ecalHome -Force | Out-Null
-          7z x $installer "-o$ecalHome" -y -bso0 -bsp0
+          $logFile  = Join-Path $env:RUNNER_TEMP 'ecal-install.log'
+          $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow `
+            -ArgumentList @(
+              '/VERYSILENT',
+              '/SUPPRESSMSGBOXES',
+              '/NORESTART',
+              "/DIR=$ecalHome",
+              "/LOG=$logFile"
+            )
+          if (-not $proc.WaitForExit(5 * 60 * 1000)) {
+            $proc.Kill()
+            if (Test-Path $logFile) { Get-Content $logFile -Tail 50 | Out-Host }
+            throw "eCAL installer did not finish within 5 minutes"
+          }
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path $logFile) { Get-Content $logFile -Tail 50 | Out-Host }
+            throw "eCAL installer exited with code $($proc.ExitCode)"
+          }
           if (-not (Test-Path "$ecalHome\bin")) {
             Get-ChildItem $ecalHome | Out-Host
-            throw "expected $ecalHome\bin after extracting $exeName"
+            throw "expected $ecalHome\bin after installing $exeName"
           }
           "$ecalHome\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 

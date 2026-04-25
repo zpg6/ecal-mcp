@@ -168,19 +168,34 @@ jobs:
             throw "downloaded $exeName looks too small ($size bytes) -- likely an HTML error page"
           }
 
-          # Extract the NSIS installer's contents directly. NSIS installs hang
-          # on the runner; 7z reads the same archive in seconds and gives us
-          # the bin/include/lib trees rustecal-sys needs.
+          # eCAL ships an Inno Setup installer (not NSIS). The earlier '/S'
+          # silent flag isn't recognized by Inno -- the installer pops a UI
+          # dialog and the runner hangs forever. Use Inno's real silent flags.
           $ecalHome = 'C:\eCAL'
-          New-Item -ItemType Directory -Path $ecalHome -Force | Out-Null
-          7z x $installer "-o$ecalHome" -y -bso0 -bsp0
+          $logFile  = Join-Path $env:RUNNER_TEMP 'ecal-install.log'
+          $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow `
+            -ArgumentList @(
+              '/VERYSILENT',
+              '/SUPPRESSMSGBOXES',
+              '/NORESTART',
+              "/DIR=$ecalHome",
+              "/LOG=$logFile"
+            )
+          if (-not $proc.WaitForExit(5 * 60 * 1000)) {
+            $proc.Kill()
+            if (Test-Path $logFile) { Get-Content $logFile -Tail 50 | Out-Host }
+            throw "eCAL installer did not finish within 5 minutes"
+          }
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path $logFile) { Get-Content $logFile -Tail 50 | Out-Host }
+            throw "eCAL installer exited with code $($proc.ExitCode)"
+          }
           if (-not (Test-Path "$ecalHome\bin")) {
             Get-ChildItem $ecalHome | Out-Host
-            throw "expected $ecalHome\bin after extracting $exeName"
+            throw "expected $ecalHome\bin after installing $exeName"
           }
-          Remove-Item -Recurse -Force "$ecalHome\`$PLUGINSDIR" -ErrorAction SilentlyContinue
-          "ECAL_HOME=$ecalHome" | Out-File -FilePath $env:GITHUB_ENV   -Append
-          "$ecalHome\bin"       | Out-File -FilePath $env:GITHUB_PATH  -Append
+          "ECAL_HOME=$ecalHome" | Out-File -FilePath $env:GITHUB_ENV  -Append
+          "$ecalHome\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
 
           # protoc: official release zip -> $RUNNER_TEMP\protoc\bin\protoc.exe
           $protocVer  = '25.1'
