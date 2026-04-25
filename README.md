@@ -51,6 +51,8 @@ macOS is not yet covered by the release matrix — build from source there.
 
 ### Build from source
 
+**Linux:**
+
 ```bash
 sudo apt-get install -y clang libclang-14-dev llvm-dev protobuf-compiler
 git clone https://github.com/zpg6/ecal-mcp && cd ecal-mcp
@@ -58,9 +60,20 @@ cargo build --release --bin ecal-mcp
 ./target/release/ecal-mcp
 ```
 
+**Windows (PowerShell):** install Visual Studio 2019+ Build Tools, the [Rust toolchain](https://rustup.rs/), and `protoc` (e.g. `choco install protoc`). With eCAL installed at `C:\eCAL`:
+
+```powershell
+$env:ECAL_HOME = 'C:\eCAL'
+git clone https://github.com/zpg6/ecal-mcp; cd ecal-mcp
+cargo build --release --bin ecal-mcp
+.\target\release\ecal-mcp.exe
+```
+
 ## Wire it into an MCP client
 
-Point your client at the binary. For example, in a Cursor / Claude Desktop config:
+Point your client at the binary. The path differs per OS:
+
+**Linux** (Cursor / Claude Desktop config):
 
 ```json
 {
@@ -71,6 +84,20 @@ Point your client at the binary. For example, in a Cursor / Claude Desktop confi
   }
 }
 ```
+
+**Windows** (Cursor / Claude Desktop config — note the `.exe` and the doubled backslashes required by JSON):
+
+```json
+{
+  "mcpServers": {
+    "ecal": {
+      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\ecal-mcp\\bin\\ecal-mcp.exe"
+    }
+  }
+}
+```
+
+(That's the default install path used by `install.ps1`. Substitute your `ECAL_MCP_PREFIX` if you overrode it. Forward slashes also work: `"C:/Users/<you>/AppData/Local/Programs/ecal-mcp/bin/ecal-mcp.exe"`.)
 
 That's it. The server discovers other eCAL processes via the same UDP multicast / SHM mechanisms eCAL always uses; if your other participants are working, this one will see them.
 
