@@ -62,8 +62,14 @@ struct TransportLayerEntry {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct TopicEntry {
     topic_name: String,
+    /// Exactly `"publisher"` or `"subscriber"` (eCAL emits the literal
+    /// lowercase strings — no other values are produced by
+    /// `CMonitoringImpl::RegisterTopic`).
     direction: String,
     data_type: DataType,
+    /// `gethostname()` on the producing process — typically the short
+    /// hostname, not an FQDN. Used together with `process_id` to identify
+    /// the producing process across the network.
     host_name: String,
     /// eCAL "shm transport domain" — defaults to `host_name`. Only matters
     /// for **cross-host-name** endpoints (e.g. two containers presenting
@@ -72,12 +78,39 @@ struct TopicEntry {
     /// same-hostname endpoints share SHM regardless of this value.
     shm_transport_domain: String,
     process_id: i32,
+    /// Producing process's executable path. On Linux this is the
+    /// **full path** (read from `/proc/self/exe` by
+    /// `eCAL::Process::GetProcessName`), not just the basename.
     process_name: String,
+    /// User-supplied "unit name" passed to `Ecal::initialize` on the
+    /// producing process (the application/component name, *not* a host or
+    /// thread name). Falls back to the process basename when not set.
     unit_name: String,
+    /// `eCAL_SEntityId.entity_id` of this publisher / subscriber endpoint
+    /// (a per-process 64-bit id derived from `pid << 40 | rand24 << 16 |
+    /// counter`). **Unique within a process and the network for that
+    /// process's lifetime, but NOT stable across process restarts.** Don't
+    /// persist this id — re-discover it after every restart.
     topic_id: i64,
+    /// Last sample's payload size in bytes. Refreshed on every send
+    /// (publisher) or receive (subscriber), so for variable-size topics
+    /// this tracks the **most recent** sample only — not max, mean, or
+    /// historical max. Use `ecal_topic_stats` for size statistics.
     topic_size: i32,
+    /// Number of **same-host** counterpart endpoints the publisher has an
+    /// active connection to. **Only populated on publisher rows**: eCAL
+    /// explicitly sets both `connections_local` and `connections_external`
+    /// to `0` on subscriber registrations (the subscriber side does not
+    /// know how many publishers are connected to it).
     connections_local: i32,
+    /// Number of **cross-host** counterpart endpoints the publisher is
+    /// connected to. Same caveat as `connections_local`: always `0` on
+    /// subscriber rows by design.
     connections_external: i32,
+    /// Subscriber-side accumulator: count of missing samples detected by
+    /// comparing successive `send_clock` values on incoming messages.
+    /// **Effectively always 0 on publisher rows** (the publisher side
+    /// doesn't fill this field in registration).
     message_drops: i32,
     /// Raw eCAL `data_frequency` value, in **millihertz** (samples / 1000s).
     /// e.g. 1000 = 1 Hz, 10_000 = 10 Hz. See `data_frequency_hz` for a
@@ -115,14 +148,31 @@ struct TopicEntry {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct MethodEntry {
     method_name: String,
+    /// Request payload type name (`SDataTypeInformation.name`). **May be
+    /// empty** when the server registers the method via rustecal's raw
+    /// `ServiceServer::add_method` (which zero-fills the type info struct)
+    /// or via any C-API caller that didn't populate
+    /// `eCAL_SServiceMethodInformation.request_datatype_information`.
+    /// Don't treat empty as "binary" — it just means "publisher didn't
+    /// advertise a type".
     request_type: String,
+    /// Response payload type name. Same caveat as `request_type`: empty
+    /// when the server didn't advertise a type.
     response_type: String,
+    /// Per-method counter incremented in-process on each handled
+    /// request (server) or issued call (client) since
+    /// **process start** — not a cluster-wide total. Resets when the
+    /// owning process restarts.
     call_count: i64,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct ServiceEntry {
     service_name: String,
+    /// `eCAL_SEntityId.entity_id` of this server registration. Same
+    /// stability rules as `TopicEntry::topic_id`: per-process 64-bit id,
+    /// **not stable across server restarts**. Use it to disambiguate
+    /// replicas within a single observation, never as a persisted handle.
     service_id: i64,
     host_name: String,
     process_id: i32,
@@ -134,6 +184,9 @@ struct ServiceEntry {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct ClientEntry {
     service_name: String,
+    /// `eCAL_SEntityId.entity_id` of this *client* registration —
+    /// per-process and not stable across restarts (see
+    /// `ServiceEntry::service_id`).
     service_id: i64,
     host_name: String,
     process_id: i32,
@@ -388,6 +441,13 @@ struct PublishArgs {
 struct PublishResult {
     topic: String,
     bytes_sent: usize,
+    /// Number of `Publisher::Send` calls that returned `true` (C return
+    /// `0`, i.e. eCAL actually wrote to at least one transport). Note that
+    /// `Send` can still return `false` **even with `subscriber_count > 0`**
+    /// — for example when every transport layer's writer reports a failed
+    /// write (`CPublisherImpl::Write` returns `false`). The
+    /// no-subscribers-yet path returns `false` as well but only calls
+    /// `RefreshSendCounter()` (no bytes on the wire).
     sends_succeeded: u32,
     sends_attempted: u32,
 }
@@ -406,12 +466,21 @@ struct SubscribeArgs {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct Sample {
-    /// Topic the sample was received on (matches the subscribed topic, but
-    /// useful when the same topic is fanned out via multiple publishers).
+    /// Topic name carried on the wire sample (`eCAL_STopicId.topic_name`).
+    /// Under normal usage this is identical to the subscription topic; it
+    /// is **not** a per-publisher discriminator — multiple publishers on
+    /// the same topic emit the same string, and you'd disambiguate them
+    /// via the publisher's `eCAL_SEntityId` (not surfaced on `Sample`).
     topic_name: String,
-    /// Send timestamp (microseconds since epoch).
+    /// Publisher's send timestamp in **microseconds since epoch**, as
+    /// stamped by the publisher process at `Send` time (auto-stamped via
+    /// `eCAL::Time::GetMicroSeconds()` unless the caller passed an
+    /// explicit time). This is *not* a subscriber receive time.
     timestamp_us: i64,
-    /// Publisher logical clock at send time.
+    /// `eCAL_SReceiveCallbackData.send_clock` — the publisher's per-message
+    /// counter at send time, increased by exactly one on each successful
+    /// `Send`. Subscribers use it for drop detection (`message_drops`).
+    /// Not the same as the subscriber's internal `m_clock`.
     clock: i64,
     /// Payload size in bytes.
     size: usize,
@@ -455,6 +524,12 @@ struct CallServiceArgs {
     /// matches this value. Useful when you want to drive exactly one of N
     /// replicas. If no instance matches the filter, the call returns
     /// `instances: 0` rather than an error.
+    ///
+    /// **Do not persist this value.** eCAL `entity_id`s are
+    /// generated per-process from `pid << 40 | rand24 << 16 | counter`
+    /// (see `entity_id_generator.cpp`); they are unique within a process's
+    /// lifetime but a server restart produces a fresh id. Re-discover via
+    /// `ecal_list_services` after every restart.
     #[serde(default)]
     target_server_entity_id: Option<u64>,
 }
@@ -745,9 +820,12 @@ struct ListFilter {
     /// "no filter".
     #[serde(default)]
     name_pattern: Option<String>,
-    /// Optional case-insensitive substring filter on `data_type.type_name`.
-    /// Mirrors the `--find` flag of `ecal_mon_cli`. Has no effect on
-    /// service/process listings (services use method-level types).
+    /// Optional case-insensitive **substring** filter on
+    /// `data_type.type_name`. Looser than `ecal_mon_cli --find`, which
+    /// requires an **exact** case-sensitive match on the type name —
+    /// substring + case-fold catches more typos and namespace variants.
+    /// Has no effect on service/process listings (services use
+    /// method-level types).
     #[serde(default)]
     type_name_pattern: Option<String>,
     /// When true, include the binary type descriptor blob (base-64) in each
@@ -968,13 +1046,17 @@ impl EcalServer {
             let mut sends_ok: u32 = 0;
             let bytes_sent: usize;
 
-            // Wait for at least one subscriber to be discovered, up to
-            // `discovery_wait`. eCAL's `CPublisher::Send` returns `false`
-            // when `GetSubscriberCount() == 0`: it still calls
-            // `RefreshSendCounter()` (so `data_clock` and frequency stats
-            // advance) but it does NOT put bytes on the wire. Polling here
-            // makes the first send actually land instead of silently
-            // dropping on a fresh publisher.
+            // Wait for at least one **active** subscriber to be discovered,
+            // up to `discovery_wait`. `GetSubscriberCount()` only counts
+            // connections whose `state == true` in
+            // `CPublisherImpl::m_connection_map` — the *first* registration
+            // ping from a new subscriber stores `state == false` and only the
+            // second update flips it on, so this is a stronger signal than
+            // "registration arrived". `CPublisher::Send` returns `false` when
+            // this count is zero: it still calls `RefreshSendCounter()` (so
+            // `data_clock` and frequency stats advance) but does NOT put bytes
+            // on the wire. Polling here makes the first send actually land
+            // instead of silently dropping on a fresh publisher.
             fn await_subscriber<T: PublisherMessage>(
                 publisher: &TypedPublisher<T>,
                 budget: Duration,
