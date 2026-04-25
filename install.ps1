@@ -37,7 +37,7 @@ function Die($msg) { Write-Error "ecal-mcp install: $msg"; exit 1 }
 
 switch -Wildcard ($env:PROCESSOR_ARCHITECTURE) {
     'AMD64' { $target = 'x86_64-pc-windows-msvc' }
-    'ARM64' { $target = 'aarch64-pc-windows-msvc' }
+    'ARM64' { Die "Windows ARM64 prebuilts are not published yet; build from source (see README)." }
     default { Die "unsupported architecture: $($env:PROCESSOR_ARCHITECTURE)" }
 }
 

@@ -15,7 +15,7 @@ Then either grab a prebuilt `ecal-mcp` binary or build from source.
 
 ### Prebuilt binary (recommended)
 
-Linux / macOS:
+Linux (x86_64 / aarch64):
 
 ```bash
 curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
@@ -99,7 +99,7 @@ Point your client at the binary. The path differs per OS:
 
 (That's the default install path used by `install.ps1`. Substitute your `ECAL_MCP_PREFIX` if you overrode it. Forward slashes also work: `"C:/Users/<you>/AppData/Local/Programs/ecal-mcp/bin/ecal-mcp.exe"`.)
 
-That's it. The server discovers other eCAL processes via the same UDP multicast / SHM mechanisms eCAL always uses; if your other participants are working, this one will see them.
+That's it. The server uses eCAL's normal registration/discovery transport — by default that's loopback UDP for local-only deployments and UDP multicast (`239.0.0.1`) once you switch to network mode in `ecal.yaml`. Topic data still flows over SHM (same host) or UDP/TCP (cross-host) like any other eCAL participant. If your other participants are working, this one will see them.
 
 ## Tools
 
