@@ -16,27 +16,47 @@ code paths blind:
      `FileDescriptorSet`-shaped blobs that real users care about.
 
   3. Cross-host SHM-domain handling. `ecal_diagnose_topic` has a finding
-     for "two hosts with distinct shm_transport_domain values" that simply
-     cannot fire when there's only one host.
+     for "N hosts (≥2) with distinct shm_transport_domain values" that
+     simply cannot fire when there's only one host.
 
-This harness fixes all three. It uses `docker compose` to bring up two
-containers (`pub` and `mcp`) on a user-defined bridge network. Both mount
-`tests/realnet/ecal.yaml`, which forces:
+This harness fixes all three with a 4-host topology that samples
+every realistic placement variant — pure pub, pure sub, pure svc, and
+two flavors of mixed-role host:
 
+                publisher  subscriber  service  MCP
+   pub  (mixed)      ✓          ✓                    (pub + sub on same topic)
+   sub  (pure)                  ✓
+   svc  (pure)                            ✓
+   mcp  (mixed)      ✓                           ✓   (MCP + pub on the same host)
+
+PUB_TOPIC therefore has **2 publishers across 2 hosts** (pub @ 10 Hz,
+mcp @ 5 Hz) and **2 dedicated remote subscribers across 2 hosts**
+(pub, sub), in addition to MCP's transient subs from
+ecal_subscribe / ecal_diagnose_topic. Why this mix matters:
+
+  * Mixed-role host (`pub`): same node both publishes AND subscribes
+    to the same topic — eCAL's self-loop case + the most realistic
+    production placement. No test of ours hit this before.
+  * Pure subscriber host (`sub`): non-MCP cross-host subscriber so
+    `ecal_list_subscribers` and `ecal_diagnose_topic` actually see a
+    remote subscriber registration (eCAL filters the caller's own
+    monitoring entries out, so MCP-side ad-hoc subscribes wouldn't
+    surface here on their own).
+  * Pure service host (`svc`): no pub/sub at all. Service routing
+    must work to a host that shares no topic transport state with
+    anyone — the strongest possible "service routing is independent
+    of topic routing" guarantee.
+
+All four containers mount `tests/realnet/ecal.yaml`, which forces:
   - eCAL network mode (UDP-multicast registration on 239.0.0.1)
   - publisher TCP layer enabled
   - subscriber UDP + SHM disabled — cross-host data MUST land on TCP
 
-The publisher container runs:
-  - `ecal-test-publisher` on `ecal_mcp_realnet_pub`  (deterministic 10 Hz)
-  - `ecal-test-service-server` on `ecal_mcp_realnet_service`
-  - eCAL's bundled `ecal_sample_person_send` if available (real protobuf
-    type "pb.People.Person" with a real FileDescriptorSet — only protobuf
-    assertions skip if the binary is missing)
-
-The MCP container runs `ecal-mcp` over `docker compose exec -i`. Every
-assertion is the cross-host counterpart of an existing intra-container
-case.
+A single suite run therefore exercises four independent bridge hops:
+  data       : pub → mcp        (TCP, cross-host topic data)
+  data       : mcp → sub        (TCP, MCP's own publisher → remote sub)
+  service    : mcp → svc        (cross-host RPC to a no-other-state host)
+  metadata   : pub, sub, svc → mcp  (UDP-multicast registration from all)
 
 Set `ECAL_MCP_KEEP_CONTAINERS=1` to leave the compose stack up after the
 run for poking with `docker compose -f tests/realnet/docker-compose.yml exec mcp …`.
@@ -68,6 +88,8 @@ COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
 IMAGE_TAG = os.environ.get("ECAL_MCP_IMAGE", "ecal-mcp:e2e")
 
 PUB_HOST = "ecal-pub"
+SUB_HOST = "ecal-sub"
+SVC_HOST = "ecal-svc"
 MCP_HOST = "ecal-mcp"
 
 PUB_TOPIC = "ecal_mcp_realnet_pub"
@@ -201,33 +223,48 @@ def main() -> int:
             runner.run("initialize handshake", t_handshake)
             time.sleep(3.0)
 
-            # ---- 2. cross-host visibility -----------------------------------
-            # We pin cross-bridge multicast registration to the
-            # *service server* unit, which is unique to the pub host —
-            # there's no other `ecal_test_service_server` competing for
-            # the same unit_name on the multicast channel, so the
-            # registration arrives reliably. (Both hosts run a
-            # `ecal_test_publisher`, and on Docker's bridge multicast
-            # the two simultaneous registrations from the same unit_name
-            # can collide enough to make process-level visibility
-            # genuinely racy; topic-level registration for the same
-            # publishers does NOT race, and we pin that down separately
-            # in the multi-publisher listing test.)
+            # ---- 2. cross-host process visibility ---------------------------
+            # We pin cross-bridge multicast registration via two
+            # *role-unique* unit_names — units that run on exactly one
+            # host so there's no duplicate-unit-name race:
+            #
+            #   * `ecal_test_service_server` exists ONLY on SVC_HOST
+            #   * `ecal_sample_person_send`  exists ONLY on PUB_HOST
+            #     (gated on availability of the bundled deb sample)
+            #
+            # We deliberately don't gate on `ecal_test_publisher` or
+            # `ecal_test_subscriber` here — those unit_names run on
+            # two hosts each, and process-level snapshots can race on
+            # duplicate unit_names (sometimes one host's registration
+            # gets dropped from the snapshot). Topic-level registration
+            # for the same processes does NOT race, and we pin those
+            # deterministically via the multi-publisher and
+            # multi-subscriber listing tests below.
             def t_cross_host_processes() -> None:
                 deadline = time.time() + 15.0
                 last_svc: set[str] = set()
+                last_person: set[str] = set()
+                require_person = person_available
                 while time.time() < deadline:
                     procs = call_tool(client, "ecal_list_processes")["processes"]
                     last_svc = {
                         p["host_name"] for p in procs
                         if p["unit_name"] == "ecal_test_service_server"
                     }
-                    if PUB_HOST in last_svc:
+                    last_person = {
+                        p["host_name"] for p in procs
+                        if "person" in p["unit_name"].lower()
+                    }
+                    svc_ok = SVC_HOST in last_svc
+                    person_ok = (not require_person) or (PUB_HOST in last_person)
+                    if svc_ok and person_ok:
                         return
                     time.sleep(0.5)
                 raise AssertionError(
-                    f"ecal_test_service_server never visible from {MCP_HOST!r} "
-                    f"in 15s — multicast registration broken? last_svc={last_svc!r}"
+                    f"cross-host registration never converged in 15s: "
+                    f"service hosts={last_svc!r} (want {{{SVC_HOST!r}}}); "
+                    f"person hosts={last_person!r} "
+                    f"(want {PUB_HOST!r}; require_person={require_person})"
                 )
 
             runner.run("cross-host process visibility", t_cross_host_processes)
@@ -370,8 +407,8 @@ def main() -> int:
                 t.join(timeout=20)
 
                 assert_true(
-                    len(resp["publishers"]) >= 2 and len(resp["subscribers"]) >= 1,
-                    f"diagnose missed pub(s) or sub: pubs={len(resp['publishers'])} "
+                    len(resp["publishers"]) >= 2 and len(resp["subscribers"]) >= 2,
+                    f"diagnose missed pub(s) or sub(s): pubs={len(resp['publishers'])} "
                     f"subs={len(resp['subscribers'])} resp={resp}",
                 )
                 # Both publisher hosts must be represented. Single-host
@@ -380,6 +417,17 @@ def main() -> int:
                 assert_eq(
                     pub_hosts_set, {PUB_HOST, MCP_HOST},
                     "diagnose pub hosts (must be {pub, mcp})",
+                )
+                # Both *remote* subscriber hosts must be represented. The
+                # MCP-side ad-hoc subscriber may also surface (it's a
+                # different process from the caller, so it's not always
+                # filtered out), but we require AT MINIMUM both pub and
+                # sub — the dedicated remote subscribers — to be there.
+                sub_hosts_set = {s["host_name"] for s in resp["subscribers"]}
+                assert_true(
+                    {PUB_HOST, SUB_HOST}.issubset(sub_hosts_set),
+                    f"diagnose missed remote subscriber(s); want ⊇ "
+                    f"{{{PUB_HOST!r}, {SUB_HOST!r}}}, got {sub_hosts_set!r}",
                 )
                 assert_true(
                     len(resp["shm_transport_domains"]) >= 2,
@@ -445,6 +493,105 @@ def main() -> int:
             runner.run("multi-publisher listing on shared topic",
                        t_multi_publisher_listing)
 
+            # ---- 7b. multi-subscriber listing on a shared topic -------------
+            # Two `ecal-test-subscriber` processes share PUB_TOPIC, on
+            # `pub` (mixed pub+sub) and `sub` (pure subscriber).
+            # ecal_list_subscribers must return BOTH with distinct
+            # host_name and distinct topic_id. This is the FIRST
+            # assertion in the suite that *deterministically* exercises
+            # cross-bridge sub-direction registration: MCP's own ad-hoc
+            # subscribers (from ecal_subscribe / ecal_diagnose_topic)
+            # are short-lived measurement windows and may or may not
+            # be present at snapshot time, so a stable remote
+            # subscriber is what proves the sub-direction multicast
+            # registration plumbing works.
+            #
+            # (eCAL's own filtering: `CSampleApplier::AcceptRegistrationSample`
+            # gates same-process samples on `registration.loopback`,
+            # which defaults to `true` — and we keep it true. So local
+            # subs *can* surface; we just don't want to depend on
+            # them being present at the right moment.)
+            def t_multi_subscriber_listing() -> None:
+                subs = [
+                    s for s in call_tool(client, "ecal_list_subscribers")["subscribers"]
+                    if s["topic_name"] == PUB_TOPIC
+                ]
+                assert_true(
+                    len(subs) >= 2,
+                    f"expected ≥2 subscribers on {PUB_TOPIC!r}: {subs}",
+                )
+
+                hosts = {s["host_name"] for s in subs}
+                assert_true(
+                    {PUB_HOST, SUB_HOST}.issubset(hosts),
+                    f"remote subscriber hosts missing — want ⊇ "
+                    f"{{{PUB_HOST!r}, {SUB_HOST!r}}}, got {hosts!r}",
+                )
+
+                topic_ids = [s["topic_id"] for s in subs]
+                assert_eq(
+                    len(set(topic_ids)), len(topic_ids),
+                    f"subscriber topic_ids not distinct: {topic_ids}",
+                )
+
+                # Each subscriber must advertise TCP (subscriber.shm
+                # is off, so the only viable cross-host layer is TCP).
+                for s in subs:
+                    kinds = {l["kind"].lower() for l in s["transport_layers"]}
+                    assert_true(
+                        "tcp" in kinds,
+                        f"subscriber on {s['host_name']!r} missing TCP layer: "
+                        f"{s['transport_layers']}",
+                    )
+
+            runner.run("multi-subscriber listing on shared topic",
+                       t_multi_subscriber_listing)
+
+            # ---- 7c. mixed-role host attribution ----------------------------
+            # PUB_HOST runs BOTH a publisher AND a subscriber on
+            # PUB_TOPIC. Mixed-role hosts are common in production but
+            # have never been pinned by this suite. We assert the
+            # exact role decomposition across the topology:
+            #
+            #   PUB_TOPIC publisher hosts   == {pub, mcp}
+            #   PUB_TOPIC subscriber hosts  ⊇ {pub, sub}   (MCP may transit)
+            #   PUB_HOST appears in BOTH the pubs and subs sets
+            #
+            # If listing logic ever drops a host from one direction
+            # because the same host already appears in the other
+            # (an easy "set-by-host" dedup bug), this catches it.
+            def t_mixed_role_host_attribution() -> None:
+                pubs = [
+                    p for p in call_tool(client, "ecal_list_publishers")["publishers"]
+                    if p["topic_name"] == PUB_TOPIC
+                ]
+                subs = [
+                    s for s in call_tool(client, "ecal_list_subscribers")["subscribers"]
+                    if s["topic_name"] == PUB_TOPIC
+                ]
+                pub_hosts = {p["host_name"] for p in pubs}
+                sub_hosts = {s["host_name"] for s in subs}
+                assert_eq(pub_hosts, {PUB_HOST, MCP_HOST},
+                          f"PUB_TOPIC publisher hosts: {pub_hosts}")
+                assert_true({PUB_HOST, SUB_HOST}.issubset(sub_hosts),
+                            f"PUB_TOPIC subscriber hosts missing — got {sub_hosts}")
+                assert_true(
+                    PUB_HOST in pub_hosts and PUB_HOST in sub_hosts,
+                    f"mixed-role host {PUB_HOST!r} not in BOTH directions: "
+                    f"pubs={pub_hosts} subs={sub_hosts}",
+                )
+                # SVC_HOST must appear in NEITHER direction — that's
+                # what makes it a pure-service host, the strongest
+                # role-decoupling proof in the topology.
+                assert_true(
+                    SVC_HOST not in pub_hosts and SVC_HOST not in sub_hosts,
+                    f"role bleed: {SVC_HOST!r} appears as a pub or sub: "
+                    f"pubs={pub_hosts} subs={sub_hosts}",
+                )
+
+            runner.run("mixed-role host attribution (pub+sub on one host)",
+                       t_mixed_role_host_attribution)
+
             # ---- 8. cross-host service call ---------------------------------
             def t_cross_host_service() -> None:
                 payload = "realnet-ping"
@@ -458,21 +605,58 @@ def main() -> int:
                 ok = [r for r in resp["responses"] if r["success"]]
                 assert_true(bool(ok), f"no successful service response: {resp}")
                 assert_eq(ok[0]["response_text"], payload, "echo response_text")
-                # The service runs in `pub`, MCP runs in `mcp` — host_name
-                # on the response is the proof that we crossed the bridge.
+                # The service runs on SVC_HOST — a host that has NO
+                # publishers and NO subscribers. If MCP routed the call
+                # to PUB_HOST or any other host where it had open TCP
+                # sessions, server_host_name would mismatch. This is the
+                # 3-host topology's load-bearing service assertion.
                 assert_eq(
-                    ok[0].get("server_host_name"), PUB_HOST,
-                    "server_host_name (cross-host service)",
+                    ok[0].get("server_host_name"), SVC_HOST,
+                    "server_host_name (cross-host service, must be svc-only host)",
                 )
 
             runner.run("cross-host service call", t_cross_host_service)
 
+            # ---- 8b. ecal_list_services attribution (svc-only host) ---------
+            # Direct, no-RPC proof that service registration's host
+            # attribution lives on SVC_HOST — independent of whatever
+            # per-call routing decision drove `server_host_name` in the
+            # previous test. (Role-bleed against pub/sub on PUB_TOPIC
+            # is asserted separately by mixed-role host attribution.)
+            def t_list_services_attribution() -> None:
+                ours = [
+                    s for s in call_tool(client, "ecal_list_services")["services"]
+                    if s["service_name"] == SERVICE_NAME
+                ]
+                assert_true(
+                    len(ours) >= 1,
+                    f"{SERVICE_NAME!r} not visible from MCP: {ours}",
+                )
+                hosts = {s["host_name"] for s in ours}
+                assert_eq(
+                    hosts, {SVC_HOST},
+                    f"service host_name set must be exactly {{{SVC_HOST!r}}}",
+                )
+
+            runner.run("ecal_list_services attribution (svc-only host)",
+                       t_list_services_attribution)
+
             # ---- 7. service call: target_server_entity_id cross-host --------
             # Two-step: discover entity_id via a wide call, then drive
-            # exactly that replica with target_server_entity_id. Critical
-            # for users running >1 replica of the same service across
-            # hosts; if the targeting filter doesn't survive cross-host
-            # routing, this fails. Mirrors tier-1 case 21 but cross-bridge.
+            # exactly that replica with target_server_entity_id.
+            # Critical for users running >1 replica of the same service
+            # across hosts. Note on semantics: eCAL's `CClientInstance`
+            # is already per-server, but the ecal-mcp handler issues
+            # one `ClientInstance::call` per discovered replica and
+            # post-filters the responses by entity_id. So the
+            # behavioral guarantee under test is "exactly one matching
+            # response, no leakage from sibling replicas, plus
+            # `discovered_instances` still reports the full set" —
+            # not "only one network RPC was issued." This still
+            # catches the failure modes that matter (filter dropped,
+            # entity_id mismatched after a bridge traversal, bogus
+            # ids matching real responses). Mirrors tier-1 case 21
+            # but cross-bridge.
             def t_target_entity_id_cross_host() -> None:
                 ping = call_tool(client, "ecal_call_service", {
                     "service": SERVICE_NAME,
@@ -483,6 +667,8 @@ def main() -> int:
                 }, timeout=15.0)
                 ok = [r for r in ping["responses"] if r["success"]]
                 assert_true(bool(ok), f"discovery call failed: {ping}")
+                assert_eq(ok[0]["server_host_name"], SVC_HOST,
+                          "discovery probe must also land on svc-only host")
                 eid = ok[0]["server_entity_id"]
                 assert_true(eid > 0, f"server_entity_id not populated: {ok[0]}")
 
@@ -499,7 +685,8 @@ def main() -> int:
                 assert_true(bool(hit_ok), f"targeted call got no success response: {hit}")
                 for r in hit_ok:
                     assert_eq(r["server_entity_id"], eid, "responding entity_id")
-                    assert_eq(r["server_host_name"], PUB_HOST, "still cross-host")
+                    assert_eq(r["server_host_name"], SVC_HOST,
+                              "targeted call still on svc-only host")
                     assert_eq(r["response_text"], "targeted-realnet", "echo payload")
 
                 # Negative: a fake entity_id must match nothing — proves

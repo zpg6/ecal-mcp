@@ -62,23 +62,28 @@ RUN mkdir -p src src/bin \
     && echo 'fn main() {}' > src/main.rs \
     && echo 'fn main() {}' > src/bin/test_publisher.rs \
     && echo 'fn main() {}' > src/bin/test_service_server.rs \
+    && echo 'fn main() {}' > src/bin/test_subscriber.rs \
     && cargo build --release --locked --bins \
     && rm -rf src target/release/ecal-mcp \
               target/release/ecal-test-publisher \
               target/release/ecal-test-service-server \
+              target/release/ecal-test-subscriber \
               target/release/deps/ecal_mcp-* \
               target/release/deps/ecal_test_publisher-* \
               target/release/deps/ecal_test_service_server-* \
+              target/release/deps/ecal_test_subscriber-* \
               target/release/.fingerprint/ecal-mcp-* \
               target/release/.fingerprint/ecal-test-publisher-* \
-              target/release/.fingerprint/ecal-test-service-server-*
+              target/release/.fingerprint/ecal-test-service-server-* \
+              target/release/.fingerprint/ecal-test-subscriber-*
 
 COPY src ./src
 RUN cargo build --release --locked --bins \
     && strip target/release/ecal-mcp \
              target/release/ecal-test-publisher \
              target/release/ecal-test-service-server \
-    && ls -la target/release/ecal-mcp target/release/ecal-test-publisher target/release/ecal-test-service-server
+             target/release/ecal-test-subscriber \
+    && ls -la target/release/ecal-mcp target/release/ecal-test-publisher target/release/ecal-test-service-server target/release/ecal-test-subscriber
 
 # ---------------------------------------------------------------------------
 # Runtime stage
@@ -108,6 +113,7 @@ RUN set -eux; \
 COPY --from=builder /build/target/release/ecal-mcp                 /usr/local/bin/ecal-mcp
 COPY --from=builder /build/target/release/ecal-test-publisher       /usr/local/bin/ecal-test-publisher
 COPY --from=builder /build/target/release/ecal-test-service-server  /usr/local/bin/ecal-test-service-server
+COPY --from=builder /build/target/release/ecal-test-subscriber      /usr/local/bin/ecal-test-subscriber
 
 # Drop privileges. eCAL only needs access to /dev/shm (world-writable) and
 # multicast/loopback, none of which require root.
