@@ -19,8 +19,19 @@
 communication_mode: "network"
 
 registration:
-  registration_refresh: 1000
-  registration_timeout: 10000
+  # Faster than the eCAL default (1000 ms) on purpose: eCAL splits each
+  # participant's registration into separate UDP samples per entity type
+  # (process / pub / sub / service-server / service-client), emitted once
+  # per refresh cycle. Docker's bridge network is lossy for multicast, so
+  # at 1 Hz a single sample type can fail to land for many seconds in a
+  # row even when other types from the same participant get through. 250 ms
+  # gives 4x the redundancy per second across all sample types and makes
+  # cross-container registration converge reliably under that loss profile.
+  registration_refresh: 250
+  # Bumped from the eCAL default (10000 ms) to keep the larger pool of
+  # samples we now emit alive long enough to be useful — otherwise the
+  # higher refresh rate just churns the snapshot.
+  registration_timeout: 30000
   loopback: true
   shm_transport_domain: ""
   local:

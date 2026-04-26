@@ -197,8 +197,8 @@ def main() -> int:
     bring_up()
     runner = TestRunner("e2e (realnet, cross-container)")
     try:
-        # eCAL's registration_refresh is 1s; allow several cycles for
-        # multicast registration to settle across the bridge.
+        # tests/realnet/ecal.yaml sets registration_refresh to 250 ms; allow
+        # several cycles for multicast registration to settle across the bridge.
         log("Waiting for cross-container registration to converge...")
         time.sleep(6.0)
 
@@ -241,7 +241,14 @@ def main() -> int:
             # deterministically via the multi-publisher and
             # multi-subscriber listing tests below.
             def t_cross_host_processes() -> None:
-                deadline = time.time() + 15.0
+                # 45s, not 15s, because UDP multicast on Docker bridge can
+                # drop a given participant's process-registration sample
+                # type for many cycles in a row even when other sample
+                # types from the same participant land. The realnet
+                # ecal.yaml drops registration_refresh to 250 ms so we
+                # get ~180 sample attempts in this window — comfortably
+                # past any realistic loss burst.
+                deadline = time.time() + 45.0
                 last_svc: set[str] = set()
                 last_person: set[str] = set()
                 require_person = person_available
@@ -261,7 +268,7 @@ def main() -> int:
                         return
                     time.sleep(0.5)
                 raise AssertionError(
-                    f"cross-host registration never converged in 15s: "
+                    f"cross-host registration never converged in 45s: "
                     f"service hosts={last_svc!r} (want {{{SVC_HOST!r}}}); "
                     f"person hosts={last_person!r} "
                     f"(want {PUB_HOST!r}; require_person={require_person})"
