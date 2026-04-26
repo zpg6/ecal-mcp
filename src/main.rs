@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use clap::Parser;
 use parking_lot::Mutex;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
@@ -25,6 +26,8 @@ use rustecal_types_bytes::BytesMessage;
 use rustecal_types_string::StringMessage;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
+
+mod cli;
 
 // ---------------------------------------------------------------------------
 // Tool argument & response types
@@ -1572,26 +1575,47 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
+    let parsed = cli::Cli::parse();
+    let cmd = parsed.command.unwrap_or(cli::Cmd::Serve);
+
     // EcalComponents::ALL = PUBLISHER | SUBSCRIBER | SERVICE | MONITORING |
-    // LOGGING | TIMESYNC. (DEFAULT already includes everything except
-    // MONITORING; we add MONITORING so `Monitoring::get_snapshot` works.)
-    // LOGGING is needed for `Log::get_logging`.
+    // LOGGING | TIMESYNC. MONITORING is needed for `Monitoring::get_snapshot`,
+    // LOGGING for `Log::get_logging`. Both MCP and CLI paths need everything.
     Ecal::initialize(Some("ecal_mcp"), EcalComponents::ALL, None)
         .map_err(|e| anyhow::anyhow!("eCAL initialize failed: {e:?}"))?;
-    tracing::info!("eCAL initialized; serving MCP over stdio");
 
-    let outcome: Result<()> = async {
-        let service = EcalServer::new()
-            .serve(rmcp::transport::stdio())
+    let outcome: Result<()> = match cmd {
+        cli::Cmd::Serve => {
+            tracing::info!("eCAL initialized; serving MCP over stdio");
+            async {
+                let service = EcalServer::new()
+                    .serve(rmcp::transport::stdio())
+                    .await
+                    .inspect_err(|e| tracing::error!(error = ?e, "MCP serve error"))?;
+                service.waiting().await?;
+                Ok(())
+            }
             .await
-            .inspect_err(|e| tracing::error!(error = ?e, "MCP serve error"))?;
-        service.waiting().await?;
-        Ok(())
-    }
-    .await;
+        }
+        other => {
+            // CLI mode: run a single command, print JSON, exit. We capture
+            // `pretty` here because Cmd is moved into `cli::run`.
+            let pretty = matches!(&other, cli::Cmd::Call { pretty: true, .. });
+            let server = EcalServer::new();
+            match cli::run(&server, other).await {
+                Ok(v) => {
+                    cli::print_value(&v, pretty);
+                    Ok(())
+                }
+                Err(msg) => {
+                    eprintln!("ecal-mcp: {msg}");
+                    Err(anyhow::anyhow!(msg))
+                }
+            }
+        }
+    };
 
     Ecal::finalize();
-    tracing::info!("eCAL finalized; MCP server shut down");
 
     outcome
 }
