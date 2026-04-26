@@ -203,26 +203,73 @@ def call_tool_expect_error(client: StdioMcpClient, name: str, arguments: dict[st
 
 
 class TestRunner:
-    def __init__(self) -> None:
-        self.failures: list[tuple[str, str]] = []
-        self.passed = 0
+    def __init__(self, suite: str = "e2e") -> None:
+        self.suite = suite
+        self.results: list[tuple[str, bool, float, str]] = []
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for r in self.results if r[1])
+
+    @property
+    def failures(self) -> list[tuple[str, str]]:
+        return [(name, err) for name, ok, _, err in self.results if not ok]
 
     def run(self, name: str, body: Callable[[], None]) -> None:
         log(f"==> {name}")
+        t0 = time.perf_counter()
         try:
             body()
-            self.passed += 1
-            log(f"    PASS: {name}")
         except Exception as exc:  # noqa: BLE001
-            self.failures.append((name, repr(exc)))
+            dt = time.perf_counter() - t0
+            self.results.append((name, False, dt, repr(exc)))
             log(f"    FAIL: {name}: {exc!r}")
+        else:
+            dt = time.perf_counter() - t0
+            self.results.append((name, True, dt, ""))
+            log(f"    PASS: {name}")
 
     def summary(self) -> int:
-        total = self.passed + len(self.failures)
-        log(f"---\n{self.passed}/{total} passed")
+        passed = self.passed
+        total = len(self.results)
+        failed = total - passed
+        log(f"---\n{passed}/{total} passed")
         for name, err in self.failures:
             log(f"  - {name}: {err}")
-        return 0 if not self.failures else 1
+        self._write_github_summary(passed, failed, total)
+        return 0 if failed == 0 else 1
+
+    def _write_github_summary(self, passed: int, failed: int, total: int) -> None:
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if not path:
+            return
+        status = "PASS" if failed == 0 else "FAIL"
+        total_secs = sum(dt for _, _, dt, _ in self.results)
+        lines: list[str] = []
+        lines.append(f"## {self.suite}: {status} ({passed}/{total} passed in {total_secs:.1f}s)")
+        lines.append("")
+        if failed:
+            lines.append("### Failures")
+            lines.append("")
+            for name, ok, _, err in self.results:
+                if not ok:
+                    lines.append(f"- **{name}** — `{err}`")
+            lines.append("")
+        lines.append("<details><summary>All cases</summary>")
+        lines.append("")
+        lines.append("| Result | Test | Duration |")
+        lines.append("| :--- | :--- | ---: |")
+        for name, ok, dt, _ in self.results:
+            mark = "PASS" if ok else "FAIL"
+            lines.append(f"| {mark} | {name} | {dt:.2f}s |")
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            log(f"WARN: could not write GITHUB_STEP_SUMMARY ({path}): {exc!r}")
 
 
 def assert_eq(actual: Any, expected: Any, label: str) -> None:
@@ -314,7 +361,7 @@ def open_mcp_client() -> StdioMcpClient:
 def main() -> int:
     build_image()
     start_container()
-    runner = TestRunner()
+    runner = TestRunner("e2e (single-container)")
     try:
         start_helpers()
         # eCAL's default `registration_refresh` is 1000ms, so a brand-new

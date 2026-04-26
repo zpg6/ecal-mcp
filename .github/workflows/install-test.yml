@@ -52,6 +52,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Install eCAL runtime
+        id: ecal_runtime
         shell: bash
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -71,10 +72,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends /tmp/ecal.deb
 
       - name: Run published install.sh
+        id: install_sh
         shell: bash
         run: curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
 
       - name: Assert binary at documented default path
+        id: assert_path
         shell: bash
         run: |
           set -euxo pipefail
@@ -86,6 +89,7 @@ jobs:
           }
 
       - name: MCP initialize handshake
+        id: handshake
         shell: bash
         run: |
           set -euo pipefail
@@ -98,6 +102,7 @@ jobs:
           echo "OK: server reports $(echo "$out" | jq -r '.result.serverInfo | "\(.name) \(.version)"')"
 
       - name: Re-install with version + prefix overrides
+        id: reinstall
         shell: bash
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -113,6 +118,33 @@ jobs:
 
           test -x "$HOME/.local/bin/ecal-mcp"
 
+      - name: Job summary (linux ${{ matrix.os }})
+        if: always()
+        shell: bash
+        run: |
+          row() {
+            local name="$1" outcome="$2"
+            local mark
+            case "$outcome" in
+              success) mark="PASS" ;;
+              skipped|"") mark="SKIP" ;;
+              *) mark="FAIL" ;;
+            esac
+            echo "| $name | $mark |"
+          }
+          {
+            echo "## install-test linux (${{ matrix.os }})"
+            echo ""
+            echo "| Step | Result |"
+            echo "| :--- | :--- |"
+            row "install eCAL runtime"            "${{ steps.ecal_runtime.outcome }}"
+            row "run published install.sh"        "${{ steps.install_sh.outcome }}"
+            row "assert binary at default path"   "${{ steps.assert_path.outcome }}"
+            row "MCP initialize handshake"        "${{ steps.handshake.outcome }}"
+            row "re-install with version+prefix"  "${{ steps.reinstall.outcome }}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # -------------------------------------------------------------------------
   # Windows: PowerShell one-liner
   # -------------------------------------------------------------------------
@@ -123,6 +155,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Install eCAL runtime
+        id: ecal_runtime
         shell: pwsh
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -184,10 +217,12 @@ jobs:
           "$ecalHome\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Run published install.ps1
+        id: install_ps1
         shell: pwsh
         run: irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
 
       - name: Assert binary at documented default path
+        id: assert_path
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -196,6 +231,7 @@ jobs:
           Get-Item $exe | Format-List FullName,Length,LastWriteTime
 
       - name: MCP initialize handshake
+        id: handshake
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -226,6 +262,7 @@ jobs:
           Write-Host "OK: server reports $($resp.result.serverInfo.name) $($resp.result.serverInfo.version)"
 
       - name: Re-install with version + prefix overrides
+        id: reinstall
         shell: pwsh
         env:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -244,3 +281,34 @@ jobs:
 
           $exe = Join-Path $env:ECAL_MCP_PREFIX 'bin\ecal-mcp.exe'
           if (-not (Test-Path $exe)) { throw "expected $exe after override install" }
+
+      - name: Job summary (windows)
+        if: always()
+        shell: pwsh
+        run: |
+          function Mark($outcome) {
+            switch ($outcome) {
+              'success'  { 'PASS' }
+              'skipped'  { 'SKIP' }
+              ''         { 'SKIP' }
+              default    { 'FAIL' }
+            }
+          }
+          $rows = @(
+            @{ name = 'install eCAL runtime';            outcome = '${{ steps.ecal_runtime.outcome }}' },
+            @{ name = 'run published install.ps1';       outcome = '${{ steps.install_ps1.outcome }}' },
+            @{ name = 'assert binary at default path';   outcome = '${{ steps.assert_path.outcome }}' },
+            @{ name = 'MCP initialize handshake';        outcome = '${{ steps.handshake.outcome }}' },
+            @{ name = 're-install with version+prefix'; outcome = '${{ steps.reinstall.outcome }}' }
+          )
+          $lines = @(
+            '## install-test windows (windows-2022)',
+            '',
+            '| Step | Result |',
+            '| :--- | :--- |'
+          )
+          foreach ($r in $rows) {
+            $lines += "| $($r.name) | $(Mark $r.outcome) |"
+          }
+          $lines += ''
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n")

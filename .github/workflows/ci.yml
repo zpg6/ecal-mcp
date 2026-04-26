@@ -39,7 +39,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: cargo fmt --check
+        id: fmt
+        run: cargo fmt --all -- --check
+
+      - name: Job summary (lint)
+        if: always()
+        run: |
+          status="${{ steps.fmt.outcome }}"
+          if [ "$status" = "success" ]; then
+            mark="PASS"
+          else
+            mark="FAIL"
+          fi
+          {
+            echo "## lint: $mark"
+            echo ""
+            echo "| Step | Result |"
+            echo "| :--- | :--- |"
+            echo "| cargo fmt --check | $mark |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
   test:
     runs-on: ubuntu-22.04
@@ -55,6 +75,7 @@ jobs:
       # Builder stage = Ubuntu + Rust + eCAL + cached cargo dep-build.
       # Used to run unit tests in the same toolchain as the release build.
       - name: Build builder image (cached)
+        id: build_builder
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -62,20 +83,44 @@ jobs:
           target: builder
           tags: ecal-mcp:builder
           cache-from: type=gha,scope=ecal-mcp-builder
-          cache-to:   type=gha,scope=ecal-mcp-builder,mode=max
+          cache-to: type=gha,scope=ecal-mcp-builder,mode=max
 
       # Mount only `src/` over the stubs baked into the builder image so we
       # reuse the prebuilt /build/target/release dep cache and skip rebuilding
       # ~hundreds of crates from scratch.
       - name: Unit tests (cargo test --release --bin ecal-mcp)
+        id: unit
         run: |
+          set -o pipefail
+          mkdir -p /tmp/ecal-mcp-logs
           docker run --rm \
             -v "$PWD/src:/build/src:ro" \
             -v "$PWD/Cargo.toml:/build/Cargo.toml:ro" \
             -v "$PWD/Cargo.lock:/build/Cargo.lock:ro" \
             -w /build \
             ecal-mcp:builder \
-            cargo test --release --bin ecal-mcp --locked
+            cargo test --release --bin ecal-mcp --locked 2>&1 \
+            | tee /tmp/ecal-mcp-logs/unit.log
+
+      - name: Unit test summary
+        if: always() && steps.unit.outcome != 'skipped'
+        run: |
+          status="${{ steps.unit.outcome }}"
+          if [ "$status" = "success" ]; then mark="PASS"; else mark="FAIL"; fi
+          {
+            echo "## unit tests (cargo test --release --bin ecal-mcp): $mark"
+            echo ""
+            if [ -f /tmp/ecal-mcp-logs/unit.log ]; then
+              # Pull the per-suite "test result: ..." lines that cargo prints.
+              results=$(grep -E '^test result:' /tmp/ecal-mcp-logs/unit.log || true)
+              if [ -n "$results" ]; then
+                echo '```'
+                echo "$results"
+                echo '```'
+                echo ""
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Runtime stage. Reuses the builder cache scope above for the cargo
       # build layer, plus its own scope for the runtime apt + eCAL deb.
@@ -90,7 +135,10 @@ jobs:
             type=gha,scope=ecal-mcp-runtime
           cache-to: type=gha,scope=ecal-mcp-runtime,mode=max
 
+      # The python harness writes its own detailed PASS/FAIL table to
+      # $GITHUB_STEP_SUMMARY via TestRunner.summary().
       - name: e2e suite (tests/e2e.py)
+        id: e2e
         env:
           ECAL_MCP_IMAGE: ecal-mcp:e2e
         run: python3 tests/e2e.py
@@ -104,6 +152,33 @@ jobs:
       # Runs after the in-container suite so a basic break is caught first
       # with the simpler topology. The runner has Docker Compose v2 already.
       - name: realnet e2e suite (tests/e2e_realnet.py)
+        id: realnet
         env:
           ECAL_MCP_IMAGE: ecal-mcp:e2e
         run: python3 tests/e2e_realnet.py
+
+      - name: Job summary (test)
+        if: always()
+        run: |
+          row() {
+            local name="$1" outcome="$2"
+            local mark
+            case "$outcome" in
+              success) mark="PASS" ;;
+              skipped) mark="SKIP" ;;
+              "")      mark="SKIP" ;;
+              *)       mark="FAIL" ;;
+            esac
+            echo "| $name | $mark |"
+          }
+          {
+            echo "## test job: rollup"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| :--- | :--- |"
+            row "build builder image"     "${{ steps.build_builder.outcome }}"
+            row "unit tests"              "${{ steps.unit.outcome }}"
+            row "e2e (single-container)"  "${{ steps.e2e.outcome }}"
+            row "e2e (realnet)"           "${{ steps.realnet.outcome }}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"

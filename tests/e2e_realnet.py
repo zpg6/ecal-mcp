@@ -195,7 +195,7 @@ def find_pub(pubs: list[dict[str, Any]], topic: str, host: str) -> dict[str, Any
 def main() -> int:
     ensure_image()
     bring_up()
-    runner = TestRunner()
+    runner = TestRunner("e2e (realnet, cross-container)")
     try:
         # eCAL's registration_refresh is 1s; allow several cycles for
         # multicast registration to settle across the bridge.
