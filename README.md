@@ -40,12 +40,12 @@ irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
 Each script detects your architecture, resolves the latest GitHub Release, verifies the `.sha256`, and installs `ecal-mcp` to a sensible default (`/usr/local/bin` on Linux, `%LOCALAPPDATA%\Programs\ecal-mcp\bin` on Windows — added to user `PATH`). Override with env vars:
 
 ```bash
-ECAL_MCP_VERSION=v0.1.1 ECAL_MCP_PREFIX=$HOME/.local \
+ECAL_MCP_VERSION=v0.1.2 ECAL_MCP_PREFIX=$HOME/.local \
   curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
 ```
 
 ```powershell
-$env:ECAL_MCP_VERSION='v0.1.1'; $env:ECAL_MCP_PREFIX="$HOME\ecal-mcp"
+$env:ECAL_MCP_VERSION='v0.1.2'; $env:ECAL_MCP_PREFIX="$HOME\ecal-mcp"
 irm https://zpg6.github.io/ecal-mcp/install.ps1 | iex
 ```
 

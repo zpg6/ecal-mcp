@@ -9,7 +9,7 @@
     Adds the bin directory to the *user* PATH if it isn't already there.
 
 .PARAMETER Version
-    Release tag (e.g. v0.1.1). Defaults to "latest". Override via -Version
+    Release tag (e.g. v0.1.2). Defaults to "latest". Override via -Version
     or $env:ECAL_MCP_VERSION.
 
 .PARAMETER Prefix

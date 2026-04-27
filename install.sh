@@ -5,7 +5,7 @@
 #   curl -fsSL https://zpg6.github.io/ecal-mcp/install.sh | bash
 #
 # Optional env vars:
-#   ECAL_MCP_VERSION   Release tag to install (e.g. v0.1.1). Defaults to "latest".
+#   ECAL_MCP_VERSION   Release tag to install (e.g. v0.1.2). Defaults to "latest".
 #   ECAL_MCP_PREFIX    Install prefix. Defaults to /usr/local (binary -> $PREFIX/bin).
 #   ECAL_MCP_REPO      GitHub repo "owner/name". Defaults to zpg6/ecal-mcp.
 
