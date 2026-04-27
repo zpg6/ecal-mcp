@@ -1,0 +1,58 @@
+# Gauntlet scenario 07: no_common_transport
+#
+# Topology where pub and sub register fine but data structurally cannot
+# flow because their enabled transport layers don't overlap:
+#
+#   - host `producer` (per-host yaml: TCP disabled on publisher; UDP+SHM only)
+#   - host `consumer` (per-host yaml: TCP only on subscriber; UDP+SHM off)
+#
+# Cross-host UDP would be the only common layer in principle, but the
+# subscriber side rejects UDP — so even though both endpoints register
+# on `/ctrl/cmd_vel`, no `transport_layer[*].active=true` ever appears
+# for either side. The diagnose tool's `no_common_transport` finding
+# is the intended signal. Naive triage that just sees "pub exists, sub
+# exists, registrations present" will miss the root cause.
+name: ecal-mcp-gauntlet-07
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  producer:
+    <<: *base
+    hostname: producer
+    volumes:
+      - ./pub_no_tcp.yaml:/home/ecal/.ecal/ecal.yaml:ro
+    command:
+      - |
+        set -eu
+        ecal-test-publisher --topic /ctrl/cmd_vel --prefix cmd --interval-ms 100 &
+        exec tail -f /dev/null
+
+  consumer:
+    <<: *base
+    hostname: consumer
+    volumes:
+      - ./sub_only_tcp.yaml:/home/ecal/.ecal/ecal.yaml:ro
+    command:
+      - |
+        set -eu
+        ecal-test-subscriber --topic /ctrl/cmd_vel &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-07-mcp
+    # MCP itself uses the permissive shared yaml so it can observe both sides.
+    volumes:
+      - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+    depends_on: [producer, consumer]
+    command: ["exec tail -f /dev/null"]

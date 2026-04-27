@@ -1,0 +1,59 @@
+# Gauntlet scenario 08: slow_callback_drops
+#
+# Publisher pumps `/telemetry` at 1 kHz with a 16 KB payload via
+# `ecal_sample_perftool pub`. Subscriber on a different host runs
+# `ecal_sample_perftool sub` with a 5 ms callback delay — the receive
+# path can't drain in real time and eCAL increments
+# `STopic.message_drops` on the subscriber's STopic. This is the
+# textbook trigger for the `message_drops` finding code; v6 documented
+# it but no scenario had ever exercised it end-to-end.
+#
+# Hard part: the headline rate (`wire_data_frequency_hz` ~ 1000 Hz, all
+# samples sent) looks healthy. The only signal that the bus is unhealthy
+# is `STopic.message_drops` on the SUB row, plus (ideally) a
+# `findings[message_drops]` from `ecal_diagnose_topic`. Naive triage
+# that just checks "is the producer alive at the right rate?" misses
+# the actual operator complaint ("subscriber is missing samples").
+name: ecal-mcp-gauntlet-08
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  fast_pub:
+    <<: *base
+    hostname: fast-pub
+    command:
+      - |
+        set -eu
+        # 1000 Hz, 16 KB payload — well above what a sleeping callback
+        # can drain. Use --quiet so logs don't drown the test output.
+        ecal_sample_perftool pub /telemetry 1000 16384 --quiet &
+        exec tail -f /dev/null
+
+  slow_sub:
+    <<: *base
+    hostname: slow-sub
+    command:
+      - |
+        set -eu
+        # Sleep 5 ms inside every callback; at 1 kHz we can only handle
+        # ~200 msg/s, so ≥80% of samples should be dropped.
+        ecal_sample_perftool sub /telemetry 5 --quiet &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-08-mcp
+    depends_on: [fast_pub, slow_sub]
+    command: ["exec tail -f /dev/null"]

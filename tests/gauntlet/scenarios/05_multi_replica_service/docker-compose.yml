@@ -1,0 +1,47 @@
+# Gauntlet scenario 05: multi_replica_service
+#
+# Two `path_planner` service servers, on hosts `planner-a` and `planner-b`.
+# Same service name, same `echo` method, two distinct entity_ids. The agent
+# must call ONLY the planner-b replica and prove only it answered — that
+# means using `target_service_id` after discovering the right id.
+# The "naive" path of calling without a target hits both replicas and
+# blurs the answer.
+name: ecal-mcp-gauntlet-05
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  planner_a:
+    <<: *base
+    hostname: planner-a
+    command:
+      - |
+        set -eu
+        ecal-test-service-server --service path_planner &
+        exec tail -f /dev/null
+
+  planner_b:
+    <<: *base
+    hostname: planner-b
+    command:
+      - |
+        set -eu
+        ecal-test-service-server --service path_planner &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-05-mcp
+    depends_on: [planner_a, planner_b]
+    command: ["exec tail -f /dev/null"]

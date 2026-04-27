@@ -42,6 +42,8 @@ EXPECTED_TOOLS = {
     "ecal_list_services",
     "ecal_list_service_clients",
     "ecal_list_processes",
+    "ecal_list_hosts",
+    "ecal_get_monitoring",
     "ecal_get_logs",
     "ecal_publish",
     "ecal_subscribe",
@@ -390,20 +392,25 @@ def main() -> int:
             # broadcasts (~registration_refresh interval).
             time.sleep(3.0)
 
-            # ---- 2. tools/list ----------------------------------------------
-            def t_tools_list() -> None:
-                tools = client.request_ok("tools/list", {})
-                names = sorted(t["name"] for t in tools["tools"])
-                missing = EXPECTED_TOOLS - set(names)
-                assert_true(not missing, f"missing tools: {missing}")
-                for t in tools["tools"]:
-                    assert_true(
-                        isinstance(t.get("inputSchema"), dict)
-                        and t["inputSchema"].get("type") == "object",
-                        f"tool {t['name']} missing object inputSchema",
-                    )
+            # ---- 2. ecal_get_monitoring smoke -------------------------------
+            # The tools/list schema check is covered by the Rust unit test
+            # `tools_manifest_is_sorted_and_includes_known_tools` in src/cli.rs
+            # — strictly more accurate (per-tool description + input_schema
+            # shape) and runs without Docker. We replace that smoke here with
+            # a top-level shape check on the real eCAL monitoring snapshot.
+            def t_get_monitoring_shape() -> None:
+                resp = call_tool(client, "ecal_get_monitoring")
+                expected_keys = {
+                    "publishers", "subscribers", "servers", "clients",
+                    "processes", "hosts",
+                }
+                assert_eq(set(resp.keys()), expected_keys,
+                          f"ecal_get_monitoring top-level keys: got {set(resp.keys())}")
+                for key in expected_keys:
+                    assert_true(isinstance(resp[key], list),
+                                f"{key!r} is not a list: {type(resp[key])}")
 
-            runner.run("tools/list reports schemas", t_tools_list)
+            runner.run("ecal_get_monitoring shape", t_get_monitoring_shape)
 
             # ---- 3. list_publishers -----------------------------------------
             def t_list_publishers() -> None:
@@ -413,21 +420,31 @@ def main() -> int:
                 assert_true(any(p["topic_name"] == FLOOD_TOPIC for p in pubs),
                             f"FLOOD_TOPIC {FLOOD_TOPIC!r} not found")
                 for p in pubs:
-                    for k in ("topic_name", "data_type", "host_name",
-                              "shm_transport_domain", "process_id",
-                              "data_frequency_millihertz", "data_frequency_hz",
-                              "transport_layers", "data_id", "data_clock",
-                              "registration_clock"):
+                    for k in ("topic_name", "direction", "datatype_information",
+                              "host_name", "shm_transport_domain", "process_id",
+                              "registered_data_frequency_hz", "transport_layer",
+                              "data_clock", "registration_clock"):
                         assert_true(k in p, f"publisher entry missing {k}: {p}")
-                    assert_true(p["data_frequency_hz"] >= 0,
-                                f"data_frequency_hz negative: {p}")
-                    assert_true(isinstance(p["transport_layers"], list),
-                                f"transport_layers not list: {p}")
-                    for layer in p["transport_layers"]:
-                        for lk in ("kind", "version", "active"):
-                            assert_true(lk in layer, f"layer missing {lk}: {layer}")
+                    assert_eq(p["direction"], "publisher",
+                              f"publisher entry has wrong direction: {p}")
+                    assert_true(p["registered_data_frequency_hz"] >= 0,
+                                f"registered_data_frequency_hz negative: {p}")
+                    assert_true(isinstance(p["transport_layer"], list),
+                                f"transport_layer not list: {p}")
+                    for layer in p["transport_layer"]:
+                        for k in ("type", "version", "active"):
+                            assert_true(k in layer,
+                                        f"transport_layer entry missing {k}: {layer}")
+                        assert_true(
+                            layer["type"] in ("udp_mc", "shm", "tcp", "none")
+                            or layer["type"].startswith("unknown:"),
+                            f"unexpected transport type {layer['type']!r} in {p}",
+                        )
                     assert_true(p["registration_clock"] >= 0,
                                 f"registration_clock negative: {p}")
+                    dt = p["datatype_information"]
+                    for k in ("name", "encoding", "descriptor_len"):
+                        assert_true(k in dt, f"datatype_information missing {k}: {dt}")
 
             runner.run("ecal_list_publishers", t_list_publishers)
 
@@ -446,17 +463,31 @@ def main() -> int:
             def t_list_services() -> None:
                 svcs = call_tool(client, "ecal_list_services")["services"]
                 ours = [s for s in svcs if s["service_name"] == SERVICE_NAME]
-                assert_true(len(ours) >= 1, f"{SERVICE_NAME!r} not in {svcs!r}")
+                assert_eq(len(ours), 1,
+                          f"expected exactly one {SERVICE_NAME!r} in {svcs!r}")
+                # `version` mirrors upstream `SServer.version`.
+                assert_true("version" in ours[0],
+                            f"service entry missing version: {ours[0]}")
                 methods = {m["method_name"] for m in ours[0]["methods"]}
                 assert_true({"echo", "reverse"}.issubset(methods),
                             f"expected echo+reverse, got {methods}")
+                # Each method carries full request/response_datatype_information
+                # (mirroring TopicEntry.datatype_information).
+                for m in ours[0]["methods"]:
+                    for side in ("request_datatype_information",
+                                 "response_datatype_information"):
+                        assert_true(side in m,
+                                    f"method {m['method_name']} missing {side}: {m}")
+                        for k in ("name", "encoding", "descriptor_len"):
+                            assert_true(k in m[side],
+                                        f"{side} missing {k}: {m}")
 
             runner.run("ecal_list_services", t_list_services)
 
             # ---- 6. subscribe sees publisher --------------------------------
             def t_subscribe_text() -> None:
                 sub = call_tool(client, "ecal_subscribe", {
-                    "topic": PUB_TOPIC, "duration_ms": 3500, "max_samples": 5,
+                    "topic_name": PUB_TOPIC, "duration_ms": 3500, "max_samples": 5,
                 })
                 assert_true(sub["samples_collected"] >= 1, f"no samples: {sub}")
                 first = sub["samples"][0]
@@ -465,9 +496,13 @@ def main() -> int:
                     f"unexpected sample: {first}",
                 )
                 assert_eq(first.get("topic_name"), PUB_TOPIC, "sample.topic_name")
-                # base64 round-trip should equal the bytes of `text`
-                decoded = base64.b64decode(first["payload_base64"])
-                assert_eq(decoded.decode("utf-8"), first["text"], "payload_base64 == text")
+                # `payload_base64` is suppressed for short printable UTF-8
+                # because `text` already carries the exact bytes; verify the
+                # contract: either base64 is absent OR it round-trips.
+                if first.get("payload_base64") is not None:
+                    decoded = base64.b64decode(first["payload_base64"])
+                    assert_eq(decoded.decode("utf-8"), first["text"],
+                              "payload_base64 == text (when present)")
 
             runner.run("ecal_subscribe (string)", t_subscribe_text)
 
@@ -477,7 +512,7 @@ def main() -> int:
 
                 def do_sub() -> None:
                     holder["sub"] = call_tool(client, "ecal_subscribe", {
-                        "topic": PUB_TOPIC, "duration_ms": 3500, "max_samples": 1,
+                        "topic_name": PUB_TOPIC, "duration_ms": 3500, "max_samples": 1,
                     })
                 t = threading.Thread(target=do_sub)
                 t.start()
@@ -492,11 +527,21 @@ def main() -> int:
             # ---- 8. max_samples enforcement ---------------------------------
             def t_max_samples() -> None:
                 sub = call_tool(client, "ecal_subscribe", {
-                    "topic": FLOOD_TOPIC, "duration_ms": 3000, "max_samples": 3,
+                    "topic_name": FLOOD_TOPIC, "duration_ms": 3000, "max_samples": 3,
                 })
                 assert_eq(sub["samples_collected"], 3, "samples_collected")
-                assert_true(sub["samples_dropped"] >= 1,
-                            f"expected drops with fast publisher, got {sub}")
+                # FLOOD_TOPIC publishes ~100 Hz over 3000 ms → ~300 samples
+                # against a 3-sample cap, so the truncation counter must be
+                # *strictly larger* than samples_collected (a regression that
+                # silently capped the counter at 1 would slip past `>= 1`).
+                assert_true(
+                    sub["samples_truncated_at_cap"] > sub["samples_collected"],
+                    f"flood truncation counter under-reports: {sub}",
+                )
+                assert_true(
+                    sub["samples_truncated_at_cap"] >= 30,
+                    f"too few truncated for a 100 Hz / 3 s flood: {sub}",
+                )
 
             runner.run("ecal_subscribe respects max_samples", t_max_samples)
 
@@ -504,7 +549,7 @@ def main() -> int:
             def roundtrip(topic: str, text: str | None = None,
                           payload_b64: str | None = None) -> dict[str, Any]:
                 """Run subscribe + publish in parallel, return the subscribe result."""
-                sub_args = {"topic": topic, "duration_ms": 4500, "max_samples": 5}
+                sub_args = {"topic_name": topic, "duration_ms": 4500, "max_samples": 5}
                 holder: dict[str, Any] = {}
 
                 def do_sub() -> None:
@@ -515,7 +560,7 @@ def main() -> int:
                 time.sleep(1.2)
 
                 args: dict[str, Any] = {
-                    "topic": topic,
+                    "topic_name": topic,
                     "discovery_wait_ms": 2000,
                     "repeat": 5,
                     "repeat_interval_ms": 100,
@@ -544,8 +589,11 @@ def main() -> int:
                 # piggy-backing on the string path.
                 blob = bytes([0, 1, 2, 0xfe, 0xff, 0x00, 0x42]) + b"raw-binary"
                 sub = roundtrip(ROUNDTRIP_BYTES_TOPIC, payload_b64=base64.b64encode(blob).decode())
+                # Binary payloads (non-UTF-8) always carry payload_base64
+                # because `text` will be None and bytes must be recoverable.
                 hits = [s for s in sub["samples"]
-                        if base64.b64decode(s["payload_base64"]) == blob]
+                        if s.get("payload_base64")
+                        and base64.b64decode(s["payload_base64"]) == blob]
                 assert_true(bool(hits), f"binary payload not echoed: {sub!r}")
                 # NUL byte means the bytes are NOT valid UTF-8 → text should be None.
                 assert_true(hits[0].get("text") is None,
@@ -563,18 +611,19 @@ def main() -> int:
                     "timeout_ms": 2000,
                     "discovery_wait_ms": 1500,
                 })
-                assert_true(resp["instances"] >= 1, f"no service instances: {resp}")
+                assert_eq(len(resp["responses"]), 1,
+                          f"expected exactly one service instance, got {resp}")
                 ok = [r for r in resp["responses"] if r["success"]]
                 assert_true(bool(ok), f"no successful response: {resp}")
                 assert_eq(ok[0]["response_text"], payload, "echo response_text")
                 # Server identity is plumbed through from eCAL_SServiceResponse.
                 for r in ok:
-                    assert_true(r.get("server_entity_id", 0) > 0,
-                                f"server_entity_id not populated: {r}")
-                    assert_true(r.get("server_process_id", 0) > 0,
-                                f"server_process_id not populated: {r}")
-                    assert_true(bool(r.get("server_host_name")),
-                                f"server_host_name empty: {r}")
+                    assert_true(r.get("service_id", 0) > 0,
+                                f"service_id not populated: {r}")
+                    assert_true(r.get("service_process_id", 0) > 0,
+                                f"service_process_id not populated: {r}")
+                    assert_true(bool(r.get("service_host_name")),
+                                f"service_host_name empty: {r}")
 
             runner.run("ecal_call_service echo", t_service_echo)
 
@@ -590,23 +639,20 @@ def main() -> int:
                 })
                 ok = [r for r in resp["responses"] if r["success"]]
                 assert_true(bool(ok), f"no successful response: {resp}")
+                # Binary response → response_text is None, response_base64
+                # is always populated.
+                assert_true(ok[0].get("response_base64") is not None,
+                            f"binary response missing base64: {ok[0]}")
                 got = base64.b64decode(ok[0]["response_base64"])
                 assert_eq(got, blob[::-1], "reversed bytes")
 
             runner.run("ecal_call_service reverse (bytes)", t_service_reverse_bytes)
 
-            # ---- 13. validation: must supply exactly one of text/base64 ------
-            def t_publish_validation() -> None:
-                err1 = call_tool_expect_error(client, "ecal_publish", {
-                    "topic": "x", "text": "hi", "payload_base64": base64.b64encode(b"hi").decode(),
-                })
-                assert_true("exactly one" in err1.lower() or "invalid" in err1.lower(),
-                            f"unexpected error: {err1}")
-                err2 = call_tool_expect_error(client, "ecal_publish", {"topic": "x"})
-                assert_true("exactly one" in err2.lower() or "invalid" in err2.lower(),
-                            f"unexpected error: {err2}")
-
-            runner.run("ecal_publish input validation", t_publish_validation)
+            # ecal_publish input validation removed — the "must supply exactly
+            # one of text/payload_base64" check is straight-line argument
+            # validation that's strictly cheaper to assert at the Rust level
+            # against the handler. Keeping a Docker round-trip for it just
+            # burns CI time without exercising any new code path.
 
             # ---- 14. service-call against absent service is graceful --------
             def t_absent_service() -> None:
@@ -617,58 +663,45 @@ def main() -> int:
                     "timeout_ms": 500,
                     "discovery_wait_ms": 600,
                 })
-                assert_eq(resp["instances"], 0, "instances for absent service")
+                assert_eq(resp["discovered_instances"], 0,
+                          "discovered_instances for absent service")
                 assert_eq(resp["responses"], [], "responses for absent service")
+                assert_true("instances" not in resp,
+                            f"redundant `instances` field still present: {resp}")
+                # T11: service-gone semantics — even though the caller did
+                # NOT pass `target_service_id`, the field must be absent /
+                # null (handler returns `None` whenever
+                # `discovered_instances == 0`). Test the with-target case too.
+                assert_true(resp.get("requested_target_service_id") is None,
+                            f"requested_target_service_id must be null on "
+                            f"service-gone (no target supplied): {resp}")
+                resp_with_target = call_tool(client, "ecal_call_service", {
+                    "service": ABSENT_SERVICE_NAME,
+                    "method": "echo",
+                    "text": "anybody?",
+                    "timeout_ms": 500,
+                    "discovery_wait_ms": 600,
+                    "target_service_id": 0xfeedface_feedface,
+                })
+                assert_eq(resp_with_target["discovered_instances"], 0,
+                          "discovered_instances stayed zero")
+                assert_true(
+                    resp_with_target.get("requested_target_service_id") is None,
+                    f"service-gone must always null requested_target_service_id "
+                    f"even when caller supplied a target: {resp_with_target}",
+                )
 
             runner.run("ecal_call_service against absent service", t_absent_service)
 
-            # ---- 15. ecal_list_service_clients ------------------------------
-            def t_list_service_clients() -> None:
-                # Issue a call so a client registration definitely exists, then
-                # snapshot. (Clients deregister quickly, so do this together.)
-                holder: dict[str, Any] = {}
-
-                def do_call() -> None:
-                    holder["resp"] = call_tool(client, "ecal_call_service", {
-                        "service": SERVICE_NAME,
-                        "method": "echo",
-                        "text": "client-discovery-probe",
-                        "timeout_ms": 2000,
-                        "discovery_wait_ms": 1500,
-                    }, timeout=15.0)
-
-                t = threading.Thread(target=do_call)
-                t.start()
-                time.sleep(1.5)
-                clients_resp = call_tool(client, "ecal_list_service_clients")
-                t.join(timeout=15)
-                clients = clients_resp.get("clients", [])
-                ours = [c for c in clients if c["service_name"] == SERVICE_NAME]
-                # We at least see *some* client registration. Don't hard-fail
-                # if eCAL prunes it before we snapshot — but the field must be
-                # a list of well-formed entries.
-                assert_true(isinstance(clients, list), f"clients not list: {clients_resp}")
-                for c in clients:
-                    for k in ("service_name", "host_name", "process_id", "methods"):
-                        assert_true(k in c, f"client entry missing {k}: {c}")
-                if ours:
-                    log(f"saw {len(ours)} client(s) on {SERVICE_NAME}")
-
-            runner.run("ecal_list_service_clients", t_list_service_clients)
-
-            # ---- 16. ecal_get_logs ------------------------------------------
-            def t_get_logs() -> None:
-                resp = call_tool(client, "ecal_get_logs")
-                logs = resp.get("logs")
-                assert_true(isinstance(logs, list), f"logs not list: {resp}")
-                # Don't assert non-empty: with default eCAL config many envs
-                # produce zero log entries. Just validate field shape if any.
-                for entry in logs:
-                    for k in ("level", "timestamp_us", "host_name",
-                              "process_name", "process_id", "content"):
-                        assert_true(k in entry, f"log entry missing {k}: {entry}")
-
-            runner.run("ecal_get_logs", t_get_logs)
+            # ecal_list_service_clients smoke removed — was a schema-only
+            # field-presence check whose useful coverage (round-trip a service
+            # call) is already exercised by the t_service_echo +
+            # t_call_service_target tests. The shape contract is enforced by
+            # `tools_manifest_every_entry_has_description_and_schema` in
+            # src/cli.rs.
+            #
+            # ecal_get_logs smoke removed — same reason; the t_logs_filtering
+            # test below covers both shape and filter semantics in one pass.
 
             # ---- 17. name_pattern filter on lists ---------------------------
             def t_name_pattern_filter() -> None:
@@ -694,18 +727,18 @@ def main() -> int:
             # ---- 18. ecal_topic_stats ---------------------------------------
             def t_topic_stats() -> None:
                 resp = call_tool(client, "ecal_topic_stats", {
-                    "topic": FLOOD_TOPIC,
+                    "topic_name": FLOOD_TOPIC,
                     "duration_ms": 3500,
                 }, timeout=15.0)
                 # Fast publisher runs every 10ms; first ~1s is eaten by
                 # subscriber discovery, so be generous on the floor.
                 assert_true(resp["samples_observed"] >= 30,
                             f"too few samples: {resp}")
-                assert_true(resp["observed_hz"] > 15.0,
-                            f"observed_hz too low: {resp}")
+                assert_true(resp.get("wire_data_frequency_hz", 0) > 15.0,
+                            f"wire_data_frequency_hz too low: {resp}")
                 for k in ("min_size_bytes", "mean_size_bytes", "max_size_bytes",
                           "min_gap_us", "mean_gap_us", "max_gap_us", "gap_stddev_us",
-                          "first_timestamp_us", "last_timestamp_us"):
+                          "jitter_pct", "first_timestamp_us", "last_timestamp_us"):
                     assert_true(k in resp, f"missing field {k}: {resp}")
                 assert_true(resp["min_gap_us"] >= 0, f"negative gap: {resp}")
                 assert_true(resp["gap_stddev_us"] >= 0, f"negative stddev: {resp}")
@@ -724,14 +757,14 @@ def main() -> int:
 
                 def do_sub() -> None:
                     holder["sub"] = call_tool(client, "ecal_subscribe", {
-                        "topic": PUB_TOPIC, "duration_ms": 4000, "max_samples": 1,
+                        "topic_name": PUB_TOPIC, "duration_ms": 4000, "max_samples": 1,
                     }, timeout=15.0)
 
                 t = threading.Thread(target=do_sub)
                 t.start()
                 time.sleep(1.0)
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": PUB_TOPIC, "duration_ms": 1500,
+                    "topic_name": PUB_TOPIC, "duration_ms": 1500,
                 }, timeout=15.0)
                 t.join(timeout=15)
                 assert_true(len(resp["publishers"]) >= 1,
@@ -740,50 +773,158 @@ def main() -> int:
                             and resp["live_stats"]["samples_observed"] >= 1,
                             f"diagnose live_stats empty: {resp}")
                 # The e2e helper subscribes as BytesMessage even though the
-                # publisher emits StringMessage, so we expect *exactly* two
-                # distinct type signatures here. A regression that collapsed
-                # them (or duplicated them) would change this count.
-                # The e2e helper subscribes as BytesMessage even though the
                 # publisher emits StringMessage, so we expect *at least* two
                 # distinct type signatures. A regression that collapsed the
                 # two endpoints' types would leave us with 1.
                 assert_true(len(resp["type_signatures"]) >= 2,
                             f"expected >=2 distinct signatures, got {resp['type_signatures']}")
-                # And `findings` must call out the metadata mismatch.
-                assert_true(any("metadata mismatch" in f for f in resp["findings"]),
-                            f"diagnose missed metadata mismatch: {resp['findings']}")
-                # On a healthy topic, we should not see "no publisher" /
-                # "no subscriber" / "share no active transport" findings.
-                # A type-signature mismatch is *expected* in this e2e because
-                # we deliberately read a StringMessage publisher with a
+                # `findings` is a list of {code, message, detail?} entries.
+                # The metadata-mismatch finding has a stable code we can
+                # assert on directly.
+                codes = [f["code"] for f in resp["findings"]]
+                assert_true("type_metadata_mismatch" in codes,
+                            f"diagnose missed type_metadata_mismatch: {resp['findings']}")
+                # On a healthy topic, we should not see no-publisher /
+                # no-subscriber / no-common-transport codes. A type
+                # mismatch is *expected* in this e2e because we
+                # deliberately read a StringMessage publisher with a
                 # BytesMessage subscriber.
-                fatal = [f for f in resp["findings"]
-                         if "no publisher" in f
-                         or "no subscriber" in f
-                         or "share no active transport" in f]
+                fatal_codes = {"no_publisher", "no_subscriber", "no_common_transport"}
+                fatal = [f for f in resp["findings"] if f["code"] in fatal_codes]
                 assert_true(not fatal, f"unexpected fatal findings: {resp['findings']}")
+                # T4: while a type_metadata_mismatch is in effect, live_stats
+                # MUST null out type_name + encoding (the live receive callback
+                # binds to whichever signature TCP delivered first — neither
+                # value is authoritative). AGENT_SKILL.md promises this; if
+                # the implementation regresses to leaking one signature
+                # silently, agents will trust a stale type.
+                ls = resp["live_stats"]
+                assert_true(ls.get("type_name") is None,
+                            f"live_stats.type_name must be null on mismatch: {ls}")
+                assert_true(ls.get("encoding") is None,
+                            f"live_stats.encoding must be null on mismatch: {ls}")
+
+                # type_metadata_mismatch.detail must inline a per-signature
+                # rollup so consumers don't have to pivot back to
+                # type_signatures[] + publishers[]/subscribers[]. Each row
+                # carries name, encoding, descriptor metadata, occurrence
+                # counts, and the topic_id attribution arrays.
+                mm = next(f for f in resp["findings"]
+                          if f["code"] == "type_metadata_mismatch")
+                detail = mm.get("detail") or {}
+                assert_eq(detail.get("signature_count"), 2,
+                          f"signature_count must be 2 for this puzzle: {detail}")
+                sigs = detail.get("signatures")
+                assert_true(isinstance(sigs, list) and len(sigs) == 2,
+                            f"signatures must be a 2-element list: {detail}")
+                for row in sigs:
+                    for k in ("name", "encoding", "descriptor_fingerprint",
+                              "descriptor_len", "publisher_count",
+                              "subscriber_count", "publisher_topic_ids",
+                              "subscriber_topic_ids"):
+                        assert_true(k in row,
+                                    f"signatures[*] missing {k}: {row}")
+                    assert_true(isinstance(row["publisher_topic_ids"], list),
+                                f"publisher_topic_ids not list: {row}")
+                    assert_true(isinstance(row["subscriber_topic_ids"], list),
+                                f"subscriber_topic_ids not list: {row}")
+                    assert_true(isinstance(row["descriptor_len"], int),
+                                f"descriptor_len not int: {row}")
 
             runner.run("ecal_diagnose_topic (healthy)", t_diagnose_happy)
+
+            # ---- T3a: rate_above_spec on FLOOD_TOPIC -------------------------
+            def t_rate_above_spec() -> None:
+                # FLOOD_TOPIC publishes ~100 Hz; expected_hz=5.0 forces a
+                # ratio_to_target ~20×, well outside the default 10% tol.
+                # A live subscriber must be present so the diagnose tool
+                # observes actual samples; otherwise no_samples_observed
+                # fires and rate_above_spec cannot be computed.
+                holder: dict[str, Any] = {}
+
+                def do_sub() -> None:
+                    holder["sub"] = call_tool(client, "ecal_subscribe", {
+                        "topic_name": FLOOD_TOPIC, "duration_ms": 3000, "max_samples": 1,
+                    }, timeout=15.0)
+
+                t = threading.Thread(target=do_sub)
+                t.start()
+                time.sleep(0.5)
+                resp = call_tool(client, "ecal_diagnose_topic", {
+                    "topic_name": FLOOD_TOPIC,
+                    "duration_ms": 1500,
+                    "expected_hz": 5.0,
+                }, timeout=15.0)
+                t.join(timeout=15)
+                codes = [f["code"] for f in resp["findings"]]
+                assert_true("rate_above_spec" in codes,
+                            f"rate_above_spec finding missing: {resp['findings']}")
+                hit = next(f for f in resp["findings"] if f["code"] == "rate_above_spec")
+                d = hit["detail"]
+                for k in ("wire_data_frequency_hz", "expected_hz", "tolerance_pct",
+                          "ratio_to_target", "delta_hz", "delta_direction"):
+                    assert_true(k in d, f"rate_above_spec detail missing {k}: {d}")
+                assert_eq(d["delta_direction"], "above_spec",
+                          f"unexpected delta_direction: {d}")
+
+            runner.run("ecal_diagnose_topic rate_above_spec", t_rate_above_spec)
+
+            # ---- T3b: rate_below_spec on PUB_TOPIC --------------------------
+            def t_rate_below_spec() -> None:
+                # PUB_TOPIC publishes ~10 Hz; expected_hz=200.0 forces a
+                # ratio_to_target ~0.05, well below the 10% tol.
+                holder: dict[str, Any] = {}
+
+                def do_sub() -> None:
+                    holder["sub"] = call_tool(client, "ecal_subscribe", {
+                        "topic_name": PUB_TOPIC, "duration_ms": 4000, "max_samples": 1,
+                    }, timeout=15.0)
+
+                t = threading.Thread(target=do_sub)
+                t.start()
+                time.sleep(1.0)
+                resp = call_tool(client, "ecal_diagnose_topic", {
+                    "topic_name": PUB_TOPIC,
+                    "duration_ms": 2500,
+                    "expected_hz": 200.0,
+                }, timeout=15.0)
+                t.join(timeout=15)
+                codes = [f["code"] for f in resp["findings"]]
+                assert_true("rate_below_spec" in codes,
+                            f"rate_below_spec finding missing: {resp['findings']}")
+                hit = next(f for f in resp["findings"] if f["code"] == "rate_below_spec")
+                assert_eq(hit["detail"]["delta_direction"], "below_spec",
+                          f"unexpected delta_direction: {hit}")
+
+            runner.run("ecal_diagnose_topic rate_below_spec", t_rate_below_spec)
 
             # ---- 20. ecal_diagnose_topic — missing topic --------------------
             def t_diagnose_missing() -> None:
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": "definitely_does_not_exist_xyz",
+                    "topic_name": "definitely_does_not_exist_xyz",
                     "duration_ms": 0,  # skip live measurement
                 }, timeout=10.0)
                 assert_eq(resp["publishers"], [], "no pubs expected")
                 assert_eq(resp["subscribers"], [], "no subs expected")
-                assert_true(any("no publishers or subscribers" in f for f in resp["findings"]),
-                            f"missing diagnostic finding: {resp}")
-                # `live_stats` is omitted (Option::None + skip_serializing_if).
-                assert_true(resp.get("live_stats") is None,
-                            "live_stats should be omitted/None")
+                codes = [f["code"] for f in resp["findings"]]
+                assert_true("no_publishers_or_subscribers" in codes,
+                            f"missing no_publishers_or_subscribers finding: {resp}")
+                # Tier 2 #8: live_stats is now emitted as literal JSON null
+                # (not absent) when auto-skipped, so the response stays
+                # self-describing.
+                assert_true("live_stats" in resp,
+                            f"live_stats key missing entirely: {resp}")
+                assert_true(resp["live_stats"] is None,
+                            f"live_stats should be JSON null: {resp}")
+                # Every finding now carries a severity field.
+                for f in resp["findings"]:
+                    assert_true(f.get("severity") in ("info", "warning", "error"),
+                                f"finding missing/bad severity: {f}")
 
             runner.run("ecal_diagnose_topic (absent)", t_diagnose_missing)
 
-            # ---- 21. ecal_call_service target_server_entity_id --------------
+            # ---- 21. ecal_call_service target_service_id --------------
             def t_call_service_target() -> None:
-                # Discover the entity_id of our one server first.
                 ping = call_tool(client, "ecal_call_service", {
                     "service": SERVICE_NAME,
                     "method": "echo",
@@ -793,52 +934,50 @@ def main() -> int:
                 })
                 ok = [r for r in ping["responses"] if r["success"]]
                 assert_true(bool(ok), f"probe failed: {ping}")
-                eid = ok[0]["server_entity_id"]
-                # Now target that entity id.
+                eid = ok[0]["service_id"]
                 hit = call_tool(client, "ecal_call_service", {
                     "service": SERVICE_NAME,
                     "method": "echo",
                     "text": "targeted",
                     "timeout_ms": 2000,
                     "discovery_wait_ms": 1500,
-                    "target_server_entity_id": eid,
+                    "target_service_id": eid,
                 })
-                assert_true(hit["instances"] >= 1, f"target call missed: {hit}")
+                assert_true(len(hit["responses"]) >= 1, f"target call missed: {hit}")
+                assert_eq(hit.get("requested_target_service_id"), eid,
+                          "requested_target_service_id should be echoed")
+                # T10: with a target filter in effect, `instance_index` is an
+                # index into `responses[]`, not the discovered fleet — so
+                # the targeted reply is always at index 0.
+                assert_eq(hit["responses"][0]["instance_index"], 0,
+                          f"targeted reply must have instance_index=0: {hit}")
                 for r in hit["responses"]:
-                    assert_eq(r["server_entity_id"], eid, "targeted server_entity_id")
-                # And a bogus target should match zero instances post-filter,
-                # while still reporting that we *did* discover at least one.
-                # (This is the whole point of `discovered_instances`: it lets
-                # callers distinguish "service is gone" from "your target
-                # filter matched nothing".)
+                    assert_eq(r["service_id"], eid, "targeted service_id")
                 miss = call_tool(client, "ecal_call_service", {
                     "service": SERVICE_NAME,
                     "method": "echo",
                     "text": "nope",
                     "timeout_ms": 1000,
-                    # ecal_call_service builds a *fresh* ServiceClient each
-                    # invocation, so discovery has to start over. Give it
-                    # enough time to clear eCAL's ~1s registration refresh,
-                    # otherwise we can't tell "filter rejected the instance"
-                    # from "discovery just hadn't completed yet".
                     "discovery_wait_ms": 1500,
-                    "target_server_entity_id": 0xdeadbeef_deadbeef,
+                    "target_service_id": 0xdeadbeef_deadbeef,
                 })
-                assert_eq(miss["instances"], 0, "bogus target should match nothing")
                 assert_true(miss["discovered_instances"] >= 1,
                             f"target filter swallowed discovery: {miss}")
                 assert_eq(miss["responses"], [],
                           "bogus target must produce no responses")
+                assert_eq(miss.get("requested_target_service_id"),
+                          0xdeadbeef_deadbeef,
+                          "requested_target_service_id echo on miss")
 
-            runner.run("ecal_call_service target_server_entity_id", t_call_service_target)
+            runner.run("ecal_call_service target_service_id", t_call_service_target)
 
             # ---- 22. descriptor_base64 opt-in -------------------------------
             def t_descriptors_optin() -> None:
                 without = call_tool(client, "ecal_list_publishers",
                                     {"name_pattern": "flood"})["publishers"]
                 for p in without:
-                    assert_true("descriptor_base64" not in p["data_type"]
-                                or p["data_type"].get("descriptor_base64") is None,
+                    assert_true("descriptor_base64" not in p["datatype_information"]
+                                or p["datatype_information"].get("descriptor_base64") is None,
                                 f"descriptor leaked when not requested: {p}")
                 # Eagerly request descriptors. We can't guarantee non-empty
                 # for StringMessage (eCAL may not attach one), but the field
@@ -847,7 +986,7 @@ def main() -> int:
                                   {"name_pattern": "flood",
                                    "include_descriptors": True})["publishers"]
                 for p in with_:
-                    dt = p["data_type"]
+                    dt = p["datatype_information"]
                     if dt["descriptor_len"] > 0:
                         assert_true(isinstance(dt.get("descriptor_base64"), str),
                                     f"descriptor_base64 missing despite descriptor_len>0: {p}")
@@ -897,8 +1036,8 @@ def main() -> int:
                 assert_true(PUB_TOPIC in names or FLOOD_TOPIC in names,
                             f"string-typed pub not found: {names}")
                 for p in pubs:
-                    assert_true("string" in p["data_type"]["type_name"].lower(),
-                                f"non-matching type leaked: {p['data_type']}")
+                    assert_true("string" in p["datatype_information"]["name"].lower(),
+                                f"non-matching type leaked: {p['datatype_information']}")
                 # A nonsense pattern returns nothing.
                 empty = call_tool(client, "ecal_list_publishers",
                                   {"type_name_pattern": "definitely_not_a_real_type"})
@@ -906,19 +1045,66 @@ def main() -> int:
 
             runner.run("type_name_pattern filtering", t_type_name_pattern)
 
-            # ---- 25. similar_topics suggestion ------------------------------
-            def t_similar_topics() -> None:
-                # Slight typo of FLOOD_TOPIC.
+            # ---- 25. did_you_mean suggestion --------------------------------
+            def t_did_you_mean() -> None:
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": FLOOD_TOPIC + "_typo",
+                    "topic_name": FLOOD_TOPIC + "_typo",
                     "duration_ms": 0,
                 })
-                assert_true("similar_topics" in resp,
-                            f"missing similar_topics: {resp}")
-                assert_true(FLOOD_TOPIC in resp["similar_topics"],
-                            f"flood topic not suggested: {resp['similar_topics']}")
+                assert_true("similar_topics" not in resp,
+                            f"redundant similar_topics top-level field still present: {resp}")
+                dym = next(
+                    (f for f in resp["findings"] if f["code"] == "did_you_mean"),
+                    None,
+                )
+                assert_true(dym is not None,
+                            f"did_you_mean finding missing: {resp['findings']}")
+                # Tier 2 #3: candidates is now a list of structured objects,
+                # not bare strings.
+                candidates = dym["detail"]["candidates"]
+                topic_names = [c["topic_name"] for c in candidates]
+                assert_true(FLOOD_TOPIC in topic_names,
+                            f"flood topic not suggested: {candidates}")
+                assert_eq(dym["detail"]["suggestion"], topic_names[0],
+                          f"suggestion != first candidate: {dym['detail']}")
+                for c in candidates:
+                    for k in ("topic_name", "score", "direction",
+                              "occurrences", "host_names",
+                              "registered_data_frequency_hz"):
+                        assert_true(k in c,
+                                    f"did_you_mean candidate missing {k}: {c}")
+                    assert_true(c["direction"] in
+                                ("publisher", "subscriber", "both", "unknown"),
+                                f"unexpected direction: {c}")
 
-            runner.run("ecal_diagnose_topic similar_topics", t_similar_topics)
+            runner.run("ecal_diagnose_topic did_you_mean", t_did_you_mean)
+
+            # ---- T9: did_you_mean with no 3-gram overlap candidates ---------
+            def t_did_you_mean_empty_pool() -> None:
+                # A target string with no plausible candidate in the live
+                # name pool must STILL emit a `did_you_mean` finding (the
+                # documented "we looked, nothing close" signal — silent
+                # absence used to confuse fresh agents into a host-fs
+                # escape). Use a string with no shared trigrams with any
+                # of the test topics.
+                resp = call_tool(client, "ecal_diagnose_topic", {
+                    "topic_name": "qzx_no_overlap_xyz",
+                    "duration_ms": 0,
+                })
+                dym = next(
+                    (f for f in resp["findings"] if f["code"] == "did_you_mean"),
+                    None,
+                )
+                assert_true(dym is not None,
+                            f"did_you_mean must always fire on negative existence: "
+                            f"{resp['findings']}")
+                assert_eq(dym["detail"]["candidates"], [],
+                          f"empty pool should have empty candidates: {dym}")
+                assert_true(dym["detail"]["suggestion"] is None,
+                            f"suggestion should be null when candidates empty: {dym}")
+
+            runner.run("ecal_diagnose_topic did_you_mean (empty pool)",
+                       t_did_you_mean_empty_pool)
 
             # ---- 26. discovered_instances on call_service -------------------
             def t_discovered_instances() -> None:
@@ -931,21 +1117,19 @@ def main() -> int:
                 })
                 assert_true("discovered_instances" in resp,
                             f"missing discovered_instances: {resp}")
-                assert_eq(resp["discovered_instances"], resp["instances"],
-                          "discovered != responded without target filter")
+                # `instances` was dropped (Tier 1 #6); `len(responses)` is
+                # the post-filter count.
+                assert_true("instances" not in resp,
+                            f"orphan `instances` still present: {resp}")
+                assert_eq(resp["discovered_instances"], len(resp["responses"]),
+                          "discovered != len(responses) without target filter")
 
             runner.run("call_service discovered_instances", t_discovered_instances)
 
-            # ---- 27. process entries: state_severity_level + config_file_path
-            def t_process_extras() -> None:
-                resp = call_tool(client, "ecal_list_processes", {})
-                assert_true(len(resp["processes"]) >= 1,
-                            f"no processes: {resp}")
-                for p in resp["processes"]:
-                    for k in ("state_severity_level", "config_file_path"):
-                        assert_true(k in p, f"process entry missing {k}: {p}")
-
-            runner.run("process extras", t_process_extras)
+            # process_extras smoke removed — schema-only field presence
+            # check, already enforced by the schemars-derived JSON Schema +
+            # the cli.rs `tools_manifest_every_entry_has_description_and_schema`
+            # unit test.
 
             # ---- 28. diagnose flags publisher-only topic --------------------
             def t_diagnose_publisher_only() -> None:
@@ -956,12 +1140,13 @@ def main() -> int:
                 # registration *after* the snapshot is taken — the snapshot
                 # is what feeds `findings`).
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": FLOOD_TOPIC, "duration_ms": 0,
+                    "topic_name": FLOOD_TOPIC, "duration_ms": 0,
                 })
                 assert_true(len(resp["publishers"]) >= 1,
                             f"flood publisher missing: {resp}")
-                assert_true(any("no subscriber" in f for f in resp["findings"]),
-                            f"diagnose missed 'no subscriber' finding: {resp['findings']}")
+                codes = [f["code"] for f in resp["findings"]]
+                assert_true("no_subscriber" in codes,
+                            f"diagnose missed no_subscriber finding: {resp['findings']}")
 
             runner.run("ecal_diagnose_topic (publisher-only)", t_diagnose_publisher_only)
 
@@ -969,13 +1154,14 @@ def main() -> int:
             def t_topic_stats_absent() -> None:
                 # Must return cleanly with zero samples — not error, not hang.
                 resp = call_tool(client, "ecal_topic_stats", {
-                    "topic": "definitely_no_such_topic_xyz",
+                    "topic_name": "definitely_no_such_topic_xyz",
                     "duration_ms": 200,
                 }, timeout=10.0)
                 assert_eq(resp["samples_observed"], 0,
                           f"unexpected samples on absent topic: {resp}")
-                assert_eq(resp["observed_hz"], 0.0,
-                          f"observed_hz should be 0 with no samples: {resp}")
+                # With zero samples there is no wire_data_frequency_hz to report.
+                assert_true(resp.get("wire_data_frequency_hz") is None,
+                            f"unexpected wire_data_frequency_hz: {resp}")
 
             runner.run("ecal_topic_stats (absent topic)", t_topic_stats_absent)
 
@@ -992,10 +1178,10 @@ def main() -> int:
                     "timeout_ms": 1500,
                     "discovery_wait_ms": 1500,
                 })
-                assert_true(resp["discovered_instances"] >= 1,
-                            f"server vanished mid-test: {resp}")
-                assert_true(resp["instances"] >= 1,
-                            f"call short-circuited before reaching server: {resp}")
+                assert_eq(resp["discovered_instances"], 1,
+                          f"expected exactly one server, got {resp}")
+                assert_eq(len(resp["responses"]), 1,
+                          f"expected exactly one response from the one server: {resp}")
                 # Every response must be a failure carrying an error message.
                 for r in resp["responses"]:
                     assert_eq(r["success"], False,

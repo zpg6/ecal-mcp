@@ -1,0 +1,60 @@
+# Gauntlet scenario 10: typed_service_no_descriptors
+#
+# Two hosts: a `server` running upstream's canonical typed RPC sample
+# `ecal_sample_ping_server` (a protobuf service `PingService` with one
+# method `Ping`, request type `pb.foo.PingRequest`, response type
+# `pb.foo.PingResponse`), and a `caller` host that does nothing on its
+# own — the gauntlet agent is the actual caller via `ecal_call_service`.
+#
+# The puzzle: the operator wants to call `Ping` but does not know the
+# request payload shape. They expect the MCP to tell them, the same way
+# `ecal_list_publishers` reveals `datatype_information` for topics.
+#
+# Hard part: in this build, `ecal_list_services` does NOT carry
+# `request_datatype_information` / `response_datatype_information` on
+# `methods[*]` (upstream `SMethod` carries both). The agent has to
+# either guess, escape to upstream sample source, or send a
+# best-effort request and observe the response. The scenario forces a
+# concrete answer about whether MCP's service surface is sufficient
+# to make a *typed* RPC call without escaping the API.
+name: ecal-mcp-gauntlet-10
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  server:
+    <<: *base
+    hostname: server
+    command:
+      - |
+        set -eu
+        ecal_sample_ping_server &
+        exec tail -f /dev/null
+
+  caller:
+    <<: *base
+    hostname: caller
+    command:
+      - |
+        set -eu
+        # Idle host so the topology is symmetric (server + caller +
+        # mcp); the gauntlet agent makes the actual RPC call from the
+        # mcp container via ecal_call_service.
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-10-mcp
+    depends_on: [server, caller]
+    command: ["exec tail -f /dev/null"]

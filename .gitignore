@@ -3,3 +3,11 @@ target/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Gauntlet ephemera — agent reports, source research, and retrospectives
+# are local artifacts of running tests/gauntlet, not source. The harness
+# itself (README.md, run_scenario.py, scenarios/) stays tracked.
+tests/gauntlet/results/
+tests/gauntlet/results_v*/
+tests/gauntlet/RETROSPECTIVE*.md
+tests/gauntlet/SOURCE_RESEARCH*.md

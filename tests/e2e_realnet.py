@@ -68,6 +68,7 @@ import base64
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -276,6 +277,35 @@ def main() -> int:
 
             runner.run("cross-host process visibility", t_cross_host_processes)
 
+            # ---- T7: ecal_list_hosts shape across all 4 containers ----------
+            def t_list_hosts_shape() -> None:
+                resp = call_tool(client, "ecal_list_hosts")
+                hosts = resp["hosts"]
+                # We have 4 containers (mcp, pub, sub, svc) — each is a
+                # distinct host_name. We require at least 2 to prove the
+                # cross-bridge attribution works; CI runners with extra
+                # registrations are tolerated as long as the per-row
+                # shape contract holds for every entry.
+                assert_true(len(hosts) >= 2,
+                            f"expected ≥2 hosts in cross-bridge topology: {hosts}")
+                required_keys = {
+                    "host_name", "shm_transport_domains", "runtime_versions",
+                    "process_count", "publisher_count", "subscriber_count",
+                    "server_count", "client_count",
+                }
+                for h in hosts:
+                    missing = required_keys - set(h.keys())
+                    assert_true(not missing,
+                                f"host entry missing keys {missing}: {h}")
+                    assert_true(isinstance(h["shm_transport_domains"], list),
+                                f"shm_transport_domains not a list: {h}")
+                    for k in ("process_count", "publisher_count",
+                              "subscriber_count", "server_count", "client_count"):
+                        assert_true(isinstance(h[k], int) and h[k] >= 0,
+                                    f"{k} must be non-negative int: {h}")
+
+            runner.run("ecal_list_hosts shape", t_list_hosts_shape)
+
             # ---- 3. multi-publisher data flow (TCP, both hosts) -------------
             # Two publishers share PUB_TOPIC: one on `pub` ("realnet" @
             # 10 Hz), one on `mcp` ("realnet-mcp" @ 5 Hz). A single
@@ -289,7 +319,7 @@ def main() -> int:
             # own prefix* (not across; eCAL doesn't merge clocks).
             def t_multi_publisher_data_flow() -> None:
                 sub = call_tool(client, "ecal_subscribe", {
-                    "topic": PUB_TOPIC, "duration_ms": 5000, "max_samples": 50,
+                    "topic_name": PUB_TOPIC, "duration_ms": 5000, "max_samples": 50,
                 }, timeout=20.0)
                 assert_true(
                     sub["samples_collected"] >= 8,
@@ -334,22 +364,19 @@ def main() -> int:
             # cheap way to catch cross-host corruption / accounting bugs.
             def t_topic_stats() -> None:
                 stats = call_tool(client, "ecal_topic_stats", {
-                    "topic": PUB_TOPIC, "duration_ms": 5000,
+                    "topic_name": PUB_TOPIC, "duration_ms": 5000,
                 }, timeout=20.0)
                 assert_true(
                     stats["samples_observed"] >= 5,
                     f"too few samples for cross-host stats: {stats}",
                 )
-                hz = stats["observed_hz"]
+                hz = stats.get("wire_data_frequency_hz", 0.0) or 0.0
                 # Combined rate of two publishers: 10 Hz (`pub`) + 5 Hz
                 # (`mcp`) = 15 Hz nominal. TCP session setup eats the
-                # front of the window, so a wide band is expected; but
-                # the floor is now ≥5 Hz (had to be ≥1 with one pub),
-                # which is a real tightening that catches "one publisher
-                # dropped out" regressions.
+                # front of the window, so a wide band is expected.
                 assert_true(
                     5.0 <= hz <= 30.0,
-                    f"observed_hz {hz!r} outside two-publisher band [5, 30]",
+                    f"wire_data_frequency_hz {hz!r} outside two-publisher band [5, 30]",
                 )
                 for k in ("min_size_bytes", "mean_size_bytes", "max_size_bytes",
                           "min_gap_us", "mean_gap_us", "max_gap_us", "gap_stddev_us",
@@ -377,12 +404,27 @@ def main() -> int:
                     stats["first_timestamp_us"] < stats["last_timestamp_us"],
                     f"timestamps not monotonic: {stats}",
                 )
+                # T8: when the topic has ≥2 publishers, ecal_topic_stats
+                # echoes a `publishers[]` rollup (same shape as the
+                # multiple_publishers finding's detail). Pin the per-row
+                # contract so a regression that drops the echo —
+                # forcing agents into a follow-up ecal_list_publishers
+                # call — fails loudly.
+                assert_true("publishers" in stats and stats["publishers"] is not None,
+                            f"topic_stats.publishers echo missing: {stats}")
+                assert_eq(len(stats["publishers"]), 2,
+                          f"expected exactly 2 echoed publishers: {stats['publishers']}")
+                for row in stats["publishers"]:
+                    for k in ("host_name", "unit_name", "process_name",
+                              "topic_id", "registered_data_frequency_hz"):
+                        assert_true(k in row,
+                                    f"echoed publishers[*] missing {k}: {row}")
 
             runner.run("cross-host topic_stats full fields", t_topic_stats)
 
             # ---- 6. diagnose: healthy + cross-host SHM-domain finding -------
             # eCAL only flags `transport_layer.active=true` while data is
-            # mid-transit, so `common_active_transports` is genuinely
+            # mid-transit, so `common_active_transport_layers` is genuinely
             # racy on a freshly-negotiated TCP session — see the comment
             # on `intersect_active_transports` in src/main.rs. Rather
             # than fight that, we assert what's structurally invariant:
@@ -400,7 +442,7 @@ def main() -> int:
 
                 def do_sub() -> None:
                     holder["sub"] = call_tool(client, "ecal_subscribe", {
-                        "topic": PUB_TOPIC, "duration_ms": 6000, "max_samples": 1,
+                        "topic_name": PUB_TOPIC, "duration_ms": 6000, "max_samples": 1,
                     }, timeout=20.0)
 
                 t = threading.Thread(target=do_sub)
@@ -409,7 +451,7 @@ def main() -> int:
                 # registration broadcast cycle before snapshotting.
                 time.sleep(3.0)
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": PUB_TOPIC, "duration_ms": 0,
+                    "topic_name": PUB_TOPIC, "duration_ms": 0,
                 }, timeout=15.0)
                 t.join(timeout=20)
 
@@ -440,21 +482,68 @@ def main() -> int:
                     len(resp["shm_transport_domains"]) >= 2,
                     f"only one SHM domain: topology not actually cross-host? {resp}",
                 )
+                codes = [f["code"] for f in resp["findings"]]
+                # `shm_domain_split` is suppressed when a real transport
+                # (TCP, here) is already negotiated — it would be pure
+                # noise on every cross-host topology and was misranking
+                # real findings in the v8 gauntlet. The cross-host SHM
+                # split is still observable structurally via
+                # `len(shm_transport_domains) >= 2`.
                 assert_true(
-                    any(
-                        "shm_transport_domain" in f and "cross-host" in f.lower()
-                        for f in resp["findings"]
-                    ),
-                    f"diagnose missed cross-host SHM-domain finding: {resp['findings']}",
+                    "shm_domain_split" not in codes,
+                    f"shm_domain_split should be suppressed when TCP is active: {resp['findings']}",
                 )
                 assert_true(
-                    not any(
-                        "data cannot flow" in f for f in resp["findings"]
-                    ),
+                    "no_common_transport" not in codes,
                     f"diagnose claims no transport when TCP is negotiated: {resp['findings']}",
                 )
 
             runner.run("ecal_diagnose_topic across hosts is clean", t_diagnose_healthy)
+
+            # ---- T1: multiple_publishers finding ----------------------------
+            # PUB_TOPIC has two publishers (one per host) plus subscribers,
+            # which is exactly the 1:N producer anti-pattern the
+            # `multiple_publishers` finding flags. We need a parallel
+            # subscribe so a registration exists at snapshot time
+            # (`subs.is_empty()` would suppress the finding by design).
+            def t_multiple_publishers_finding() -> None:
+                holder: dict[str, Any] = {}
+
+                def do_sub() -> None:
+                    holder["sub"] = call_tool(client, "ecal_subscribe", {
+                        "topic_name": PUB_TOPIC, "duration_ms": 4000, "max_samples": 1,
+                    }, timeout=20.0)
+
+                t = threading.Thread(target=do_sub)
+                t.start()
+                time.sleep(2.0)
+                resp = call_tool(client, "ecal_diagnose_topic", {
+                    "topic_name": PUB_TOPIC, "duration_ms": 0,
+                }, timeout=15.0)
+                t.join(timeout=20)
+
+                hit = next(
+                    (f for f in resp["findings"] if f["code"] == "multiple_publishers"),
+                    None,
+                )
+                assert_true(hit is not None,
+                            f"multiple_publishers finding missing: {resp['findings']}")
+                d = hit["detail"]
+                for k in ("publishers", "rate_divergence_ratio", "host_divergence"):
+                    assert_true(k in d, f"multiple_publishers detail missing {k}: {d}")
+                assert_eq(len(d["publishers"]), 2,
+                          f"expected 2 publishers in detail: {d}")
+                for row in d["publishers"]:
+                    for k in ("host_name", "unit_name", "process_id",
+                              "topic_id", "registered_data_frequency_hz",
+                              "data_clock"):
+                        assert_true(k in row,
+                                    f"detail.publishers[*] missing {k}: {row}")
+                assert_eq(d["host_divergence"], True,
+                          f"both hosts publish: host_divergence must be true: {d}")
+
+            runner.run("ecal_diagnose_topic multiple_publishers finding",
+                       t_multiple_publishers_finding)
 
             # ---- 7. multi-publisher listing on a shared topic ---------------
             # Two `ecal-test-publisher` processes share PUB_TOPIC, one
@@ -477,14 +566,19 @@ def main() -> int:
                 assert_eq(len(set(topic_ids)), 2,
                           f"topic_ids not distinct across publishers: {topic_ids}")
 
-                # Each publisher must independently advertise TCP — that's
-                # the layer in use for both the cross-host AND the
-                # same-host (subscriber.shm disabled) data paths.
+                # Each publisher must independently advertise TCP as an
+                # active transport — TCP is the layer in use for both the
+                # cross-host AND the same-host (subscriber.shm disabled)
+                # data paths.
                 for p in pubs:
-                    kinds = {l["kind"].lower() for l in p["transport_layers"]}
+                    tcp_active = any(
+                        l.get("type") == "tcp" and l.get("active")
+                        for l in p.get("transport_layer", [])
+                    )
                     assert_true(
-                        "tcp" in kinds,
-                        f"publisher on {p['host_name']!r} missing TCP layer: {p['transport_layers']}",
+                        tcp_active,
+                        f"publisher on {p['host_name']!r} not active on TCP: "
+                        f"{p.get('transport_layer')}",
                     )
 
                 # The MCP-side publisher is on the same host as the
@@ -541,14 +635,18 @@ def main() -> int:
                     f"subscriber topic_ids not distinct: {topic_ids}",
                 )
 
-                # Each subscriber must advertise TCP (subscriber.shm
-                # is off, so the only viable cross-host layer is TCP).
+                # Each subscriber must advertise TCP as an active
+                # transport (subscriber.shm is off, so the only viable
+                # cross-host layer is TCP).
                 for s in subs:
-                    kinds = {l["kind"].lower() for l in s["transport_layers"]}
+                    tcp_active = any(
+                        l.get("type") == "tcp" and l.get("active")
+                        for l in s.get("transport_layer", [])
+                    )
                     assert_true(
-                        "tcp" in kinds,
-                        f"subscriber on {s['host_name']!r} missing TCP layer: "
-                        f"{s['transport_layers']}",
+                        tcp_active,
+                        f"subscriber on {s['host_name']!r} not active on TCP: "
+                        f"{s.get('transport_layer')}",
                     )
 
             runner.run("multi-subscriber listing on shared topic",
@@ -615,11 +713,11 @@ def main() -> int:
                 # The service runs on SVC_HOST — a host that has NO
                 # publishers and NO subscribers. If MCP routed the call
                 # to PUB_HOST or any other host where it had open TCP
-                # sessions, server_host_name would mismatch. This is the
+                # sessions, service_host_name would mismatch. This is the
                 # 3-host topology's load-bearing service assertion.
                 assert_eq(
-                    ok[0].get("server_host_name"), SVC_HOST,
-                    "server_host_name (cross-host service, must be svc-only host)",
+                    ok[0].get("service_host_name"), SVC_HOST,
+                    "service_host_name (cross-host service, must be svc-only host)",
                 )
 
             runner.run("cross-host service call", t_cross_host_service)
@@ -627,7 +725,7 @@ def main() -> int:
             # ---- 8b. ecal_list_services attribution (svc-only host) ---------
             # Direct, no-RPC proof that service registration's host
             # attribution lives on SVC_HOST — independent of whatever
-            # per-call routing decision drove `server_host_name` in the
+            # per-call routing decision drove `service_host_name` in the
             # previous test. (Role-bleed against pub/sub on PUB_TOPIC
             # is asserted separately by mixed-role host attribution.)
             def t_list_services_attribution() -> None:
@@ -635,9 +733,9 @@ def main() -> int:
                     s for s in call_tool(client, "ecal_list_services")["services"]
                     if s["service_name"] == SERVICE_NAME
                 ]
-                assert_true(
-                    len(ours) >= 1,
-                    f"{SERVICE_NAME!r} not visible from MCP: {ours}",
+                assert_eq(
+                    len(ours), 1,
+                    f"expected exactly one {SERVICE_NAME!r} visible from MCP: {ours}",
                 )
                 hosts = {s["host_name"] for s in ours}
                 assert_eq(
@@ -648,71 +746,16 @@ def main() -> int:
             runner.run("ecal_list_services attribution (svc-only host)",
                        t_list_services_attribution)
 
-            # ---- 7. service call: target_server_entity_id cross-host --------
-            # Two-step: discover entity_id via a wide call, then drive
-            # exactly that replica with target_server_entity_id.
-            # Critical for users running >1 replica of the same service
-            # across hosts. Note on semantics: eCAL's `CClientInstance`
-            # is already per-server, but the ecal-mcp handler issues
-            # one `ClientInstance::call` per discovered replica and
-            # post-filters the responses by entity_id. So the
-            # behavioral guarantee under test is "exactly one matching
-            # response, no leakage from sibling replicas, plus
-            # `discovered_instances` still reports the full set" —
-            # not "only one network RPC was issued." This still
-            # catches the failure modes that matter (filter dropped,
-            # entity_id mismatched after a bridge traversal, bogus
-            # ids matching real responses). Mirrors tier-1 case 21
-            # but cross-bridge.
-            def t_target_entity_id_cross_host() -> None:
-                ping = call_tool(client, "ecal_call_service", {
-                    "service": SERVICE_NAME,
-                    "method": "echo",
-                    "text": "discover-eid",
-                    "timeout_ms": 2500,
-                    "discovery_wait_ms": 2000,
-                }, timeout=15.0)
-                ok = [r for r in ping["responses"] if r["success"]]
-                assert_true(bool(ok), f"discovery call failed: {ping}")
-                assert_eq(ok[0]["server_host_name"], SVC_HOST,
-                          "discovery probe must also land on svc-only host")
-                eid = ok[0]["server_entity_id"]
-                assert_true(eid > 0, f"server_entity_id not populated: {ok[0]}")
-
-                hit = call_tool(client, "ecal_call_service", {
-                    "service": SERVICE_NAME,
-                    "method": "echo",
-                    "text": "targeted-realnet",
-                    "timeout_ms": 2500,
-                    "discovery_wait_ms": 2000,
-                    "target_server_entity_id": eid,
-                }, timeout=15.0)
-                assert_true(hit["instances"] >= 1, f"targeted call missed: {hit}")
-                hit_ok = [r for r in hit["responses"] if r["success"]]
-                assert_true(bool(hit_ok), f"targeted call got no success response: {hit}")
-                for r in hit_ok:
-                    assert_eq(r["server_entity_id"], eid, "responding entity_id")
-                    assert_eq(r["server_host_name"], SVC_HOST,
-                              "targeted call still on svc-only host")
-                    assert_eq(r["response_text"], "targeted-realnet", "echo payload")
-
-                # Negative: a fake entity_id must match nothing — proves
-                # the filter is real, not a no-op.
-                miss = call_tool(client, "ecal_call_service", {
-                    "service": SERVICE_NAME,
-                    "method": "echo",
-                    "text": "should-not-route",
-                    "timeout_ms": 1500,
-                    "discovery_wait_ms": 1500,
-                    "target_server_entity_id": 0xdeadbeef_deadbeef,
-                }, timeout=15.0)
-                assert_eq(miss["instances"], 0, "bogus entity_id matched something")
-                assert_true(
-                    miss["discovered_instances"] >= 1,
-                    f"discovered_instances must show real server still visible: {miss}",
-                )
-
-            runner.run("service target_server_entity_id cross-host", t_target_entity_id_cross_host)
+            # The full target_service_id flow (echo on hit, miss responses
+            # empty + discovered_instances preserved, requested_target_service_id
+            # echo) is exercised end-to-end by tests/e2e.py:t_call_service_target.
+            # The unique cross-host bit (targeted call still lands on
+            # SVC_HOST, not just any host with an open TCP session) is now
+            # folded into t_cross_host_service via service_host_name above —
+            # eCAL routes calls to the registered server host regardless of
+            # whether targeting is in effect, so once the cross-host service
+            # call lands on SVC_HOST, no separate replica-targeting test
+            # adds load-bearing coverage at this tier.
 
             # ---- 8. service client registration crosses the bridge ----------
             # When MCP (on ecal-mcp) calls a service in `pub`, MCP becomes
@@ -789,8 +832,8 @@ def main() -> int:
                 # Type encodings must differ (string vs proto) — proves we
                 # didn't accidentally collapse two distinct registrations
                 # into one.
-                pub_enc = (by_topic[(PUB_TOPIC, PUB_HOST)].get("data_type") or {}).get("encoding", "")
-                person_enc = (by_topic[(PERSON_TOPIC, PUB_HOST)].get("data_type") or {}).get("encoding", "")
+                pub_enc = (by_topic[(PUB_TOPIC, PUB_HOST)].get("datatype_information") or {}).get("encoding", "")
+                person_enc = (by_topic[(PERSON_TOPIC, PUB_HOST)].get("datatype_information") or {}).get("encoding", "")
                 assert_true(
                     pub_enc.lower() != person_enc.lower(),
                     f"both topics report same encoding {pub_enc!r}; types collapsed?",
@@ -825,8 +868,8 @@ def main() -> int:
                     f"{[(p['topic_name'], p['host_name']) for p in pubs]}",
                 )
                 p = ours[0]
-                dt = p.get("data_type") or {}
-                type_name = dt.get("type_name", "")
+                dt = p.get("datatype_information") or {}
+                type_name = dt.get("name", "")
                 encoding = dt.get("encoding", "")
                 assert_true(
                     "person" in type_name.lower(),
@@ -874,7 +917,7 @@ def main() -> int:
                     log("    SKIP: ecal_sample_person_send not in image")
                     return
                 resp = call_tool(client, "ecal_diagnose_topic", {
-                    "topic": PERSON_TOPIC, "duration_ms": 2500,
+                    "topic_name": PERSON_TOPIC, "duration_ms": 2500,
                 }, timeout=20.0)
                 assert_true(
                     len(resp["publishers"]) >= 1,
@@ -889,13 +932,13 @@ def main() -> int:
                     f"expected proto encoding, got {sigs[0]!r}",
                 )
                 assert_true(
-                    "person" in sigs[0]["type_name"].lower(),
-                    f"expected Person type_name, got {sigs[0]!r}",
+                    "person" in sigs[0]["name"].lower(),
+                    f"expected Person name, got {sigs[0]!r}",
                 )
                 # live_stats present and shaped right.
                 live = resp.get("live_stats")
                 assert_true(live is not None, f"live_stats missing despite duration_ms>0: {resp}")
-                for k in ("samples_observed", "observed_hz",
+                for k in ("samples_observed", "wire_data_frequency_hz",
                           "min_size_bytes", "max_size_bytes"):
                     assert_true(k in live, f"live_stats missing {k}: {live}")
                 # The eCAL person sample publishes at 2 Hz by default.
@@ -913,9 +956,10 @@ def main() -> int:
                 )
                 pub_hosts = {p["host_name"] for p in resp["publishers"]}
                 assert_eq(pub_hosts, {PUB_HOST}, "person publisher host")
+                codes = [f["code"] for f in resp["findings"]]
                 assert_true(
-                    not any("data cannot flow" in f for f in resp["findings"]),
-                    f"unexpected 'data cannot flow' finding: {resp['findings']}",
+                    "no_common_transport" not in codes,
+                    f"unexpected no_common_transport finding: {resp['findings']}",
                 )
 
             runner.run("diagnose typed topic + live_stats", t_diagnose_person_with_live)

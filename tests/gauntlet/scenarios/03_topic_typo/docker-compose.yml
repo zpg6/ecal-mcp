@@ -1,0 +1,39 @@
+# Gauntlet scenario 03: topic_typo
+#
+# Real publisher is `/sensors/lidar_front`. The agent is told to debug
+# `/sensor/lidar` (note: missing 's' on sensors, missing _front suffix).
+# Both sides of the typo are wrong; ecal_diagnose_topic's `did_you_mean`
+# finding (with `detail.candidates` / `detail.suggestion`) exists exactly
+# for this. A couple of decoy topics so the suggestion isn't trivial.
+name: ecal-mcp-gauntlet-03
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  sensors:
+    <<: *base
+    hostname: sensors
+    command:
+      - |
+        set -eu
+        ecal-test-publisher --topic /sensors/lidar_front --prefix lf --interval-ms 100 &
+        ecal-test-publisher --topic /sensors/lidar_rear --prefix lr --interval-ms 100 &
+        ecal-test-publisher --topic /sensors/camera_front --prefix cf --interval-ms 50 &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-03-mcp
+    depends_on: [sensors]
+    command: ["exec tail -f /dev/null"]

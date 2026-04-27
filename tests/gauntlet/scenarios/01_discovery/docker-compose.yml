@@ -1,0 +1,64 @@
+# Gauntlet scenario 01: discovery
+#
+# A small but realistic-looking robot stack:
+#   - sensors host: imu @ 100Hz, lidar @ 10Hz publishers
+#   - controller host: cmd_vel subscriber + odometry @ 50Hz publisher
+#   - planner host: path_planner service server
+#   - mcp host: where the agent runs the CLI from
+#
+# The puzzle: "Tell me what's on this network." The agent has to compose
+# ecal_list_publishers / ecal_list_subscribers / ecal_list_services /
+# ecal_list_processes into a coherent system summary. No bugs to find;
+# this is the baseline "do the listing tools surface the right info?".
+name: ecal-mcp-gauntlet-01
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  sensors:
+    <<: *base
+    hostname: sensors
+    command:
+      - |
+        set -eu
+        ecal-test-publisher --topic /sensors/imu --prefix imu --interval-ms 10 &
+        ecal-test-publisher --topic /sensors/lidar --prefix lidar --interval-ms 100 &
+        exec tail -f /dev/null
+
+  controller:
+    <<: *base
+    hostname: controller
+    command:
+      - |
+        set -eu
+        ecal-test-publisher --topic /robot/odometry --prefix odom --interval-ms 20 &
+        ecal-test-subscriber --topic /robot/cmd_vel &
+        exec tail -f /dev/null
+
+  planner:
+    <<: *base
+    hostname: planner
+    command:
+      - |
+        set -eu
+        ecal-test-service-server --service /motion/path_planner &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-01-mcp
+    depends_on: [sensors, controller, planner]
+    command: ["exec tail -f /dev/null"]
+    stdin_open: true
+    tty: false

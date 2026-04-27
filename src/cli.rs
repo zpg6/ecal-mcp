@@ -46,24 +46,34 @@ pub enum Cmd {
     /// Run the MCP server over stdio (default).
     Serve,
 
-    /// Print the list of MCP tool names + descriptions as JSON.
+    /// Print the list of MCP tool names + descriptions + input schemas as
+    /// JSON.
     ///
     /// Useful as the very first call from an agent: discover what tools are
     /// available and what each one is for. To learn the exact arguments a
-    /// tool accepts, just call it with no args (or wrong args) — the serde
-    /// error will name the required fields.
-    Tools,
+    /// tool accepts, read the `input_schema` field for that tool — or just
+    /// call it with no args, the serde error will name what's required.
+    ///
+    /// Pretty-prints by default (this output is meant to be read by humans
+    /// or agents). Pass `--compact` for a single-line JSON dump suitable
+    /// for piping to other programs.
+    Tools {
+        /// Emit a single compact JSON line instead of the default
+        /// pretty-printed multi-line form.
+        #[arg(long)]
+        compact: bool,
+    },
 
     /// Invoke a single tool and print its JSON result on stdout.
     ///
     /// Args are supplied either as a complete JSON object via `--json`, or
     /// piecemeal via repeated `-a key=value` flags (values are parsed as JSON
-    /// when possible, falling back to a string). Use `tools --schemas` to
-    /// see what each tool accepts.
+    /// when possible, falling back to a string). Run `ecal-mcp tools` to see
+    /// the JSON schema each tool accepts.
     ///
     /// Example:
     ///
-    ///   ecal-mcp call ecal_diagnose_topic -a topic=/sensors/lidar -a duration_ms=2000
+    ///   ecal-mcp call ecal_diagnose_topic -a topic_name=/sensors/lidar -a duration_ms=2000
     ///   ecal-mcp call ecal_list_publishers --json '{"name_pattern":"imu"}'
     Call {
         /// Tool name (e.g. `ecal_diagnose_topic`). See `ecal-mcp tools`.
@@ -83,14 +93,26 @@ pub enum Cmd {
         /// is friendlier to pipe through `jq`).
         #[arg(long)]
         pretty: bool,
+
+        /// Block this many milliseconds AFTER eCAL initializes and BEFORE the
+        /// tool runs, so peer registrations have time to arrive. Each
+        /// one-shot CLI invocation is a brand-new eCAL participant, so the
+        /// monitoring snapshot is empty until the first registration cycles
+        /// (~1 s each in default config) have completed. 2000 ms covers
+        /// healthy networks; bump this if a fresh `ecal-mcp call list-...`
+        /// keeps returning empty results. Has no effect on `serve` (the
+        /// long-lived MCP server is already past the convergence window by
+        /// the time it accepts a request).
+        #[arg(long, default_value_t = 2000)]
+        settle_ms: u64,
     },
 }
 
 /// Build the args JSON object from either `--json` or repeated `-a key=value` flags.
 fn build_args(json: Option<String>, kv: Vec<String>) -> Result<Value, String> {
     if let Some(raw) = json {
-        let v: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("--json is not valid JSON: {e}"))?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("--json is not valid JSON: {e}"))?;
         if !v.is_object() {
             return Err("--json must be a JSON object".into());
         }
@@ -139,9 +161,18 @@ fn tools_manifest() -> Value {
 pub async fn run(server: &EcalServer, cmd: Cmd) -> Result<Value, String> {
     match cmd {
         Cmd::Serve => unreachable!("Serve handled in main()"),
-        Cmd::Tools => Ok(tools_manifest()),
-        Cmd::Call { tool, json, arg, pretty: _ } => {
+        Cmd::Tools { .. } => Ok(tools_manifest()),
+        Cmd::Call {
+            tool,
+            json,
+            arg,
+            pretty: _,
+            settle_ms,
+        } => {
             let args = build_args(json, arg)?;
+            if settle_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+            }
             dispatch(server, &tool, args).await
         }
     }
@@ -169,6 +200,8 @@ async fn dispatch(server: &EcalServer, tool: &str, args: Value) -> Result<Value,
         "ecal_list_services" => call!(crate::ListFilter, ecal_list_services),
         "ecal_list_service_clients" => call!(crate::ListFilter, ecal_list_service_clients),
         "ecal_list_processes" => call!(crate::ListFilter, ecal_list_processes),
+        "ecal_list_hosts" => call!(crate::ListFilter, ecal_list_hosts),
+        "ecal_get_monitoring" => call!(crate::GetMonitoringArgs, ecal_get_monitoring),
         "ecal_get_logs" => call!(crate::GetLogsArgs, ecal_get_logs),
         "ecal_publish" => call!(crate::PublishArgs, ecal_publish),
         "ecal_subscribe" => call!(crate::SubscribeArgs, ecal_subscribe),
@@ -239,8 +272,11 @@ mod tests {
 
     #[test]
     fn build_args_json_path() {
-        let v = build_args(Some("{\"topic\":\"/foo\",\"duration_ms\":2000}".into()), vec![])
-            .unwrap();
+        let v = build_args(
+            Some("{\"topic\":\"/foo\",\"duration_ms\":2000}".into()),
+            vec![],
+        )
+        .unwrap();
         assert_eq!(v["topic"], json!("/foo"));
         assert_eq!(v["duration_ms"], json!(2000));
     }
@@ -295,9 +331,9 @@ mod tests {
                 !desc.trim().is_empty(),
                 "tool {name:?} has no description in the live registry"
             );
-            let schema = entry["input_schema"].as_object().unwrap_or_else(|| {
-                panic!("tool {name:?} has no input_schema object")
-            });
+            let schema = entry["input_schema"]
+                .as_object()
+                .unwrap_or_else(|| panic!("tool {name:?} has no input_schema object"));
             assert_eq!(
                 schema.get("type").and_then(Value::as_str),
                 Some("object"),
@@ -314,14 +350,30 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "tools_manifest output must be name-sorted");
-        // Spot-check the three tools agents reach for first; if any of these
-        // ever gets renamed, callers will need to know.
-        for must_have in ["ecal_diagnose_topic", "ecal_topic_stats", "ecal_list_publishers"] {
-            assert!(
-                names.contains(&must_have),
-                "tools_manifest missing {must_have:?}: {names:?}"
-            );
-        }
+        // Pin the FULL set of tool names — must stay in lockstep with
+        // `EXPECTED_TOOLS` in `tests/e2e.py`. A tool rename without a
+        // matching e2e/skill/README update fails fast here.
+        let expected = [
+            "ecal_call_service",
+            "ecal_diagnose_topic",
+            "ecal_get_logs",
+            "ecal_get_monitoring",
+            "ecal_list_hosts",
+            "ecal_list_processes",
+            "ecal_list_publishers",
+            "ecal_list_service_clients",
+            "ecal_list_services",
+            "ecal_list_subscribers",
+            "ecal_publish",
+            "ecal_subscribe",
+            "ecal_topic_stats",
+        ];
+        let actual: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        let want: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+        assert_eq!(
+            actual, want,
+            "tools_manifest tool-name set drift: actual={actual:?} expected={want:?}"
+        );
     }
 }
 

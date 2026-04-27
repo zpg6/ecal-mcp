@@ -24,7 +24,8 @@ test: builder-image
 e2e:
 	ECAL_MCP_IMAGE=$(IMAGE_TAG) python3 tests/e2e.py
 
-# Cross-container ("realnet") e2e: two containers on a user-defined Docker
+# Cross-container ("realnet") e2e: four containers (ecal-pub, ecal-sub,
+# ecal-svc, ecal-mcp) on a user-defined Docker
 # bridge with eCAL in network mode + TCP transport. Validates code paths the
 # single-container e2e structurally cannot reach (cross-host transport
 # selection, real protobuf descriptors via the bundled person sample, and the

@@ -1,0 +1,45 @@
+# Gauntlet scenario 02: silent_topic
+#
+# Subscriber on /cmd_vel exists, NO publisher does. The intended diagnosis
+# path is `ecal_diagnose_topic` returning a finding like "subscribers exist
+# but no publisher is registered" — explicit and actionable. We deliberately
+# also run unrelated traffic on /heartbeat so the agent has to disambiguate.
+name: ecal-mcp-gauntlet-02
+
+networks:
+  net:
+    driver: bridge
+
+x-base: &base
+  image: ecal-mcp:e2e
+  networks: [net]
+  shm_size: 256m
+  volumes:
+    - ../shared/ecal.yaml:/home/ecal/.ecal/ecal.yaml:ro
+  entrypoint: ["/bin/sh", "-c"]
+
+services:
+  controller:
+    <<: *base
+    hostname: controller
+    command:
+      - |
+        set -eu
+        ecal-test-subscriber --topic /cmd_vel &
+        exec tail -f /dev/null
+
+  monitor:
+    <<: *base
+    hostname: monitor
+    command:
+      - |
+        set -eu
+        ecal-test-publisher --topic /heartbeat --prefix beat --interval-ms 1000 &
+        exec tail -f /dev/null
+
+  mcp:
+    <<: *base
+    hostname: mcp
+    container_name: ecal-mcp-gauntlet-02-mcp
+    depends_on: [controller, monitor]
+    command: ["exec tail -f /dev/null"]

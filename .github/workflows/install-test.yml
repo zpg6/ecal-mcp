@@ -286,20 +286,24 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          # Use `if/elseif` instead of `switch` — switch's empty-string arm
+          # has historically been finicky on `pwsh`, leading to skipped
+          # steps (whose `${{ ... .outcome }}` GHA substitutes as the
+          # literal empty string) falling through to `default` = 'FAIL'.
+          # Doubled-quoted strings here are safer than single-quoted: if a
+          # future GHA expression ever contains an apostrophe, we keep
+          # parsing the surrounding string correctly.
           function Mark($outcome) {
-            switch ($outcome) {
-              'success'  { 'PASS' }
-              'skipped'  { 'SKIP' }
-              ''         { 'SKIP' }
-              default    { 'FAIL' }
-            }
+            if ($outcome -eq 'success') { return 'PASS' }
+            if ($outcome -eq 'skipped' -or [string]::IsNullOrEmpty($outcome)) { return 'SKIP' }
+            return 'FAIL'
           }
           $rows = @(
-            @{ name = 'install eCAL runtime';            outcome = '${{ steps.ecal_runtime.outcome }}' },
-            @{ name = 'run published install.ps1';       outcome = '${{ steps.install_ps1.outcome }}' },
-            @{ name = 'assert binary at default path';   outcome = '${{ steps.assert_path.outcome }}' },
-            @{ name = 'MCP initialize handshake';        outcome = '${{ steps.handshake.outcome }}' },
-            @{ name = 're-install with version+prefix'; outcome = '${{ steps.reinstall.outcome }}' }
+            @{ name = 'install eCAL runtime';            outcome = "${{ steps.ecal_runtime.outcome }}" },
+            @{ name = 'run published install.ps1';       outcome = "${{ steps.install_ps1.outcome }}" },
+            @{ name = 'assert binary at default path';   outcome = "${{ steps.assert_path.outcome }}" },
+            @{ name = 'MCP initialize handshake';        outcome = "${{ steps.handshake.outcome }}" },
+            @{ name = 're-install with version+prefix'; outcome = "${{ steps.reinstall.outcome }}" }
           )
           $lines = @(
             '## install-test windows (windows-2022)',

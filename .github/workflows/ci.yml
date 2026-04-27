@@ -143,8 +143,9 @@ jobs:
           ECAL_MCP_IMAGE: ecal-mcp:e2e
         run: python3 tests/e2e.py
 
-      # Cross-container "realnet" suite: two containers on a user-defined
-      # Docker bridge, eCAL in network mode forced over TCP. Exercises code
+      # Cross-container "realnet" suite: four containers (ecal-pub, ecal-sub,
+      # ecal-svc, ecal-mcp) on a user-defined Docker bridge, eCAL in network
+      # mode forced over TCP. Exercises code
       # paths the single-container suite structurally cannot reach
       # (cross-host transport selection, real protobuf descriptors, and the
       # cross-host shm_transport_domain finding in ecal_diagnose_topic).
