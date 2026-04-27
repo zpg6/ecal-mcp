@@ -288,8 +288,8 @@ jobs:
         run: |
           # Use `if/elseif` instead of `switch` — switch's empty-string arm
           # has historically been finicky on `pwsh`, leading to skipped
-          # steps (whose `${{ ... .outcome }}` GHA substitutes as the
-          # literal empty string) falling through to `default` = 'FAIL'.
+          # steps (whose step.outcome GHA substitutes as the literal empty
+          # string) falling through to `default` = 'FAIL'.
           # Doubled-quoted strings here are safer than single-quoted: if a
           # future GHA expression ever contains an apostrophe, we keep
           # parsing the surrounding string correctly.
