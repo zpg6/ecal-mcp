@@ -1236,7 +1236,8 @@ fn measure_topic(
         (Some(min), Some(mean), Some(max), Some(var.sqrt()))
     };
 
-    let wire_data_frequency_hz = mean_gap_us.and_then(|m| if m > 0.0 { Some(1.0e6 / m) } else { None });
+    let wire_data_frequency_hz =
+        mean_gap_us.and_then(|m| if m > 0.0 { Some(1.0e6 / m) } else { None });
     let jitter_pct = match (gap_stddev_us, mean_gap_us) {
         (Some(sd), Some(m)) if m > 0.0 => Some(sd / m),
         _ => None,
@@ -3247,10 +3248,7 @@ mod tests {
             severity_for(FindingCode::MultiplePublishers),
             FindingSeverity::Warning
         );
-        assert_eq!(
-            severity_for(FindingCode::DidYouMean),
-            FindingSeverity::Info
-        );
+        assert_eq!(severity_for(FindingCode::DidYouMean), FindingSeverity::Info);
 
         // Sort is code_rank-primary (likely-root-cause), severity
         // tiebreaker. A load-bearing `multiple_publishers` (warning)
@@ -3308,7 +3306,13 @@ mod tests {
         }
     }
 
-    fn raw_topic(host: &str, pid: i32, topic_name: &str, topic_id: i64, hz_mhz: i32) -> RawTopicInfo {
+    fn raw_topic(
+        host: &str,
+        pid: i32,
+        topic_name: &str,
+        topic_id: i64,
+        hz_mhz: i32,
+    ) -> RawTopicInfo {
         RawTopicInfo {
             registration_clock: 1,
             host_name: host.to_string(),
@@ -3406,9 +3410,9 @@ mod tests {
         // closest-length candidate must rank first via the
         // -len_diff tiebreaker.
         let pool = [
-            "robot/imuABC",         // len_diff = 3
-            "robot/imuABCDEF",      // len_diff = 6
-            "robot/imuABCDEFGHIJ",  // len_diff = 10
+            "robot/imuABC",        // len_diff = 3
+            "robot/imuABCDEF",     // len_diff = 6
+            "robot/imuABCDEFGHIJ", // len_diff = 10
         ];
         let hits = similar_names("robot/imu", pool.iter().copied(), 3);
         assert_eq!(hits.first().map(String::as_str), Some("robot/imuABC"));
@@ -3479,7 +3483,11 @@ mod tests {
         let (code, msg, detail) = result;
         assert!(matches!(code, FindingCode::UnhealthyProcess));
         assert!(msg.contains("non-healthy"));
-        let d = detail.expect("detail required").as_object().cloned().unwrap();
+        let d = detail
+            .expect("detail required")
+            .as_object()
+            .cloned()
+            .unwrap();
         for key in [
             "side",
             "host_name",
